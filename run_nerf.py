@@ -572,10 +572,10 @@ def config_parser():
     return parser
 
 
-def train():
+def train(_args):
 
     parser = config_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(_args)
     
     if args.random_seed is not None:
         print('Fixing random seed', args.random_seed)
@@ -925,4 +925,4 @@ def train():
 
 
 if __name__ == '__main__':
-    train()
+    train(sys.argv[1:])
