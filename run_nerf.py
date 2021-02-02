@@ -257,7 +257,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, focal,
+def render(H, W, fxfycxcy,
            chunk=1024*32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None,
@@ -267,7 +267,7 @@ def render(H, W, focal,
     Args:
       H: int. Height of image in pixels.
       W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
+      fxfycxcy: numpy array of length 4. Contains intrinsic parameters of pinhole camera.
       chunk: int. Maximum number of rays to process simultaneously. Used to
         control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for
@@ -289,7 +289,7 @@ def render(H, W, focal,
 
     if c2w is not None:
         # special case to render full image
-        rays_o, rays_d = get_rays(H, W, focal, c2w)
+        rays_o, rays_d = get_rays(H, W, fxfycxcy, c2w)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
@@ -299,7 +299,7 @@ def render(H, W, focal,
         viewdirs = rays_d
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam)
+            rays_o, rays_d = get_rays(H, W, fxfycxcy, c2w_staticcam)
 
         # Make all directions unit magnitude.
         # shape: [batch_size, 3]
@@ -307,10 +307,10 @@ def render(H, W, focal,
         viewdirs = tf.cast(tf.reshape(viewdirs, [-1, 3]), dtype=tf.float32)
 
     sh = rays_d.shape  # [..., 3]
-    if ndc:
-        # for forward facing scenes
-        rays_o, rays_d = ndc_rays(
-            H, W, focal, tf.cast(1., tf.float32), rays_o, rays_d)
+#     if ndc:
+#         # for forward facing scenes
+#         rays_o, rays_d = ndc_rays(
+#             H, W, focal, tf.cast(1., tf.float32), rays_o, rays_d)
 
     # Create ray batch
     rays_o = tf.cast(tf.reshape(rays_o, [-1, 3]), dtype=tf.float32)
@@ -354,7 +354,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
         print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(
-            H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+            H, W, [focal, focal, W*0.5, H*0.5], chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
         if i == 0:
@@ -586,9 +586,21 @@ def train(_args):
 
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
-        hwf = poses[0, :3, -1]
+                                                                  recenter=True,
+                                                                  spherify=args.spherify) # removed bd_factor=.75
+        
+        ### lbx start
+        intrinsics = np.load(args.datadir + '/cam_mtx_list.npy')
+        fxfycxcy = []
+        for pose in poses:
+            row = pose[2,-1]
+            fxfycxcy.append([intrinsics[row, 0, 0], intrinsics[row, 1, 1], intrinsics[row, 0, 2], intrinsics[row, 1, 2]])
+        
+        hwf = np.zeros(3)
+        hwf = np.array([poses[0, 0, -1], poses[0, 1, -1], fxfycxcy[0][0]])
+        # hwf[2] is the focal length uesd to render novel views
+        ### lbx end
+        
         poses = poses[:, :3, :4]
         print('Loaded llff', images.shape,
               render_poses.shape, hwf, args.datadir)
@@ -726,7 +738,12 @@ def train(_args):
         print('get rays')
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
-        rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+        
+        ### lbx start
+        rays = [get_rays_np(H, W, fxfycxcy[i], poses[i, :3, :4]) for i in range(poses.shape[0])]
+        # rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+        ### lbx end
+        
         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
@@ -780,7 +797,7 @@ def train(_args):
             pose = poses[img_i, :3, :4]
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, focal, pose)
+                rays_o, rays_d = get_rays(H, W, fxfycxcy[img_i], pose)
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
@@ -808,7 +825,7 @@ def train(_args):
 
             # Make predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
-                H, W, focal, chunk=args.chunk, rays=batch_rays,
+                H, W, [focal, focal, W*0.5, H*0.5], chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
@@ -889,7 +906,7 @@ def train(_args):
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]
 
-                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                rgb, disp, acc, extras = render(H, W, fxfycxcy[img_i], chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
 
                 psnr = mse2psnr(img2mse(rgb, target))
