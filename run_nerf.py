@@ -593,7 +593,7 @@ def train(_args):
         intrinsics = np.load(args.datadir + '/cam_mtx_list.npy')
         fxfycxcy = []
         for pose in poses:
-            row = pose[2,-1]
+            row = int(pose[2,-1])
             fxfycxcy.append([intrinsics[row, 0, 0], intrinsics[row, 1, 1], intrinsics[row, 0, 2], intrinsics[row, 1, 2]])
         
         hwf = np.zeros(3)
