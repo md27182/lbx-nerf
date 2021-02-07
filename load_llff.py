@@ -1,4 +1,6 @@
 import numpy as np
+from tqdm import tqdm
+import random
 import os, imageio
 
 
@@ -59,7 +61,7 @@ def _minify(basedir, factors=[], resolutions=[]):
         
         
         
-def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
+def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, subset_size=None):
     
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
@@ -71,23 +73,6 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
     sfx = ''
     
-    if factor is not None:
-        sfx = '_{}'.format(factor)
-        _minify(basedir, factors=[factor])
-        factor = factor
-    elif height is not None:
-        factor = sh[0] / float(height)
-        width = int(sh[1] / factor)
-        _minify(basedir, resolutions=[[height, width]])
-        sfx = '_{}x{}'.format(width, height)
-    elif width is not None:
-        factor = sh[1] / float(width)
-        height = int(sh[0] / factor)
-        _minify(basedir, resolutions=[[height, width]])
-        sfx = '_{}x{}'.format(width, height)
-    else:
-        factor = 1
-    
     imgdir = os.path.join(basedir, 'images' + sfx)
     if not os.path.exists(imgdir):
         print( imgdir, 'does not exist, returning' )
@@ -98,9 +83,39 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
     
+    # overwrite h,w,f in all poses
     sh = imageio.imread(imgfiles[0]).shape
+    sh = [int(sh[0] * 1./factor), int(sh[1] * 1./factor)]
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
+    
+    intrinsics = np.load(basedir + '/cam_mtx_list.npy')
+    intrinsics = intrinsics / factor
+    fxfycxcy = np.zeros((3240, 4))
+    for i in range(3240):
+        row = i // 120
+        fxfycxcy[i,:] = np.array([intrinsics[row, 0, 0], intrinsics[row, 1, 1], intrinsics[row, 0, 2], intrinsics[row, 1, 2]])
+    
+        
+    indices_subset = []
+        
+    if subset_size is not None:
+        assert len(imgfiles) == 3240
+        # values were taken from mike's even spacing calculator script
+        row_weights = 120 / np.array([20, 9, 6, 5, 4, 3, 3, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+        row_weights = row_weights / np.sum(row_weights)
+        rows_to_sample = np.random.choice(range(27), subset_size, replace=True, p=row_weights)
+        
+        for row in range(27):
+            num_samples = np.sum(rows_to_sample == row)
+            indices = np.random.choice(range(120), size=num_samples, replace=False)
+            for i in indices:
+                indices_subset.append(row*120 + i)
+    
+    poses = poses[:,:,indices_subset]
+    bds = bds[:,indices_subset]
+    fxfycxcy = fxfycxcy[indices_subset,:]
+    imgfiles = [imgfiles[i] for i in indices_subset]
     
     if not load_imgs:
         return poses, bds
@@ -110,12 +125,17 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
             return imageio.imread(f, ignoregamma=True)
         else:
             return imageio.imread(f)
+    
+    imgs = np.zeros((sh[0], sh[1], 3, subset_size), dtype=np.uint8)
+    for i, f in enumerate(tqdm(imgfiles)):
+        # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
+        imgs[...,i] = (imread(f)[...,:3]).reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
         
-    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
-    imgs = np.stack(imgs, -1)  
+#     imgs = imgs = [(imread(f)[...,:3]).astype(np.uint8) for f in imgfiles]
+#     imgs = np.stack(imgs, -1)  
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
-    return poses, bds, imgs
+    return poses, bds, imgs, fxfycxcy
 
     
             
@@ -240,17 +260,16 @@ def spherify_poses(poses, bds):
     return poses_reset, new_poses, bds
     
 
-def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False):
+def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False, subset_size=None):
     
 
-    poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
+    poses, bds, imgs, fxfycxcy = _load_data(basedir, factor=factor, subset_size=subset_size) # factor=8 downsamples original imgs by 8x
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
-    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
-    images = imgs
+    imgs = np.moveaxis(imgs, -1, 0)
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
     
     # Rescale if bd_factor is provided
@@ -304,16 +323,15 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
 
     c2w = poses_avg(poses)
     print('Data:')
-    print(poses.shape, images.shape, bds.shape)
+    print(poses.shape, imgs.shape, bds.shape)
     
     dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
     i_test = np.argmin(dists)
     print('HOLDOUT view is', i_test)
     
-    images = images.astype(np.float32)
     poses = poses.astype(np.float32)
 
-    return images, poses, bds, render_poses, i_test
+    return imgs, poses, bds, render_poses, i_test, fxfycxcy
 
 
 

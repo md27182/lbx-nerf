@@ -246,8 +246,10 @@ def render_rays(ray_batch,
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
+    print('[lbx debug]--> rays_flat.shape', rays_flat.shape)
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        print('[lbx debug]--> i, i + chunk', i, i + chunk)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -583,19 +585,17 @@ def train(_args):
         tf.compat.v1.set_random_seed(args.random_seed)
 
     # Load data
-
-    if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True,
-                                                                  spherify=args.spherify) # removed bd_factor=.75
+    ### lbx start
+    if args.factor == 1:
+        subset_size = 100
+    elif args.factor == 2:
+        subset_size = 3 #324
+    else:
+        subset_size = None
         
-        ### lbx start
-        intrinsics = np.load(args.datadir + '/cam_mtx_list.npy')
-        intrinsics = intrinsics / args.factor
-        rows = np.load(args.datadir + '/rows.npy')
-        fxfycxcy = []
-        for row, pose in zip(rows, poses):
-            fxfycxcy.append([intrinsics[row, 0, 0], intrinsics[row, 1, 1], intrinsics[row, 0, 2], intrinsics[row, 1, 2]])
+    if args.dataset_type == 'llff':
+        images, poses, bds, render_poses, i_test, fxfycxcy = load_llff_data(args.datadir, args.factor, recenter=True, spherify=args.spherify, subset_size=subset_size) # removed bd_factor=.75, added subset_size parameter
+        
         ### lbx end
         
         hwf = poses[0, :3, -1]
@@ -695,7 +695,7 @@ def train(_args):
         print('RENDER ONLY')
         if args.render_test:
             # render_test switches to test poses
-            images = images[i_test]
+            images = np.multiply((1./255), images[i_test], dtype=np.float32)
         else:
             # Default is smoother render_poses path
             images = None
@@ -727,38 +727,38 @@ def train(_args):
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
-    if use_batching:
-        # For random ray batching.
-        #
-        # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
-        # interpreted as,
-        #   axis=0: ray origin in world space
-        #   axis=1: ray direction in world space
-        #   axis=2: observed RGB color of pixel
-        print('get rays')
-        # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
-        # for each pixel in the image. This stack() adds a new dimension.
+#     if use_batching:
+#         # For random ray batching.
+#         #
+#         # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
+#         # interpreted as,
+#         #   axis=0: ray origin in world space
+#         #   axis=1: ray direction in world space
+#         #   axis=2: observed RGB color of pixel
+#         print('get rays')
+#         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
+#         # for each pixel in the image. This stack() adds a new dimension.
         
-        ### lbx start
-        rays = [get_rays_np(H, W, fxfycxcy[i], poses[i, :3, :4]) for i in range(poses.shape[0])]
-        # rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        ### lbx end
+#         ### lbx start
+#         rays = [get_rays_np(H, W, fxfycxcy[i], poses[i, :3, :4]) for i in range(poses.shape[0])]
+#         # rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+#         ### lbx end
         
-        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
-        print('done, concats')
-        # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
-        # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = np.stack([rays_rgb[i]
-                             for i in i_train], axis=0)  # train images only
-        # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
-        rays_rgb = rays_rgb.astype(np.float32)
-        print('shuffle rays')
-        np.random.shuffle(rays_rgb)
-        print('done')
-        i_batch = 0
+#         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
+#         print('done, concats')
+#         # [N, ro+rd+rgb, H, W, 3]
+#         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+#         # [N, H, W, ro+rd+rgb, 3]
+#         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+#         rays_rgb = np.stack([rays_rgb[i]
+#                              for i in i_train], axis=0)  # train images only
+#         # [(N-1)*H*W, ro+rd+rgb, 3]
+#         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+#         rays_rgb = rays_rgb.astype(np.float32)
+#         print('shuffle rays')
+#         np.random.shuffle(rays_rgb)
+#         print('done')
+#         i_batch = 0
 
     N_iters = 1000000
     print('Begin')
@@ -774,50 +774,33 @@ def train(_args):
     for i in range(start, N_iters):
         time0 = time.time()
 
-        # Sample random ray batch
+        # Sample random ray batch from one image
+        img_i = np.random.choice(i_train)
+        target = np.multiply((1./255), images[img_i], dtype=np.float32)
+        pose = poses[img_i, :3, :4]
 
-        if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
-            batch = tf.transpose(batch, [1, 0, 2])
-
-            # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
-            # target_s[n, rgb] = example_id, observed color.
-            batch_rays, target_s = batch[:2], batch[2]
-
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                np.random.shuffle(rays_rgb)
-                i_batch = 0
-
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = images[img_i]
-            pose = poses[img_i, :3, :4]
-
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, fxfycxcy[img_i], pose)
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = tf.stack(tf.meshgrid(
-                        tf.range(H//2 - dH, H//2 + dH), 
-                        tf.range(W//2 - dW, W//2 + dW), 
-                        indexing='ij'), -1)
-                    if i < 10:
-                        print('precrop', dH, dW, coords[0,0], coords[-1,-1])
-                else:
-                    coords = tf.stack(tf.meshgrid(
-                        tf.range(H), tf.range(W), indexing='ij'), -1)
-                coords = tf.reshape(coords, [-1, 2])
-                select_inds = np.random.choice(
-                    coords.shape[0], size=[N_rand], replace=False)
-                select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis])
-                rays_o = tf.gather_nd(rays_o, select_inds)
-                rays_d = tf.gather_nd(rays_d, select_inds)
-                batch_rays = tf.stack([rays_o, rays_d], 0)
-                target_s = tf.gather_nd(target, select_inds)
+        if N_rand is not None:
+            rays_o, rays_d = get_rays(H, W, fxfycxcy[img_i], pose)
+            if i < args.precrop_iters:
+                dH = int(H//2 * args.precrop_frac)
+                dW = int(W//2 * args.precrop_frac)
+                coords = tf.stack(tf.meshgrid(
+                    tf.range(H//2 - dH, H//2 + dH), 
+                    tf.range(W//2 - dW, W//2 + dW), 
+                    indexing='ij'), -1)
+                if i < 10:
+                    print('precrop', dH, dW, coords[0,0], coords[-1,-1])
+            else:
+                coords = tf.stack(tf.meshgrid(
+                    tf.range(H), tf.range(W), indexing='ij'), -1)
+            coords = tf.reshape(coords, [-1, 2])
+            select_inds = np.random.choice(
+                coords.shape[0], size=[N_rand], replace=False)
+            select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis])
+            rays_o = tf.gather_nd(rays_o, select_inds)
+            rays_d = tf.gather_nd(rays_d, select_inds)
+            batch_rays = tf.stack([rays_o, rays_d], 0)
+            target_s = tf.gather_nd(target, select_inds)
 
         #####  Core optimization loop  #####
 
@@ -825,7 +808,7 @@ def train(_args):
 
             # Make predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
-                H, W, [focal, focal, W*0.5, H*0.5], chunk=args.chunk, rays=batch_rays,
+                H, W, None, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
@@ -885,7 +868,8 @@ def train(_args):
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
             render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
-                        gt_imgs=images[i_test], savedir=testsavedir)
+                        gt_imgs=np.multiply((1./255), images[i_test], dtype=np.float32),
+                        savedir=testsavedir)
             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
@@ -902,19 +886,32 @@ def train(_args):
             if i % args.i_img == 0:
 
                 # Log a rendered validation view to Tensorboard
+                if args.render_factor != 0:
+                    rf = args.render_factor
+                else:
+                    rf = 1
+                
                 img_i = np.random.choice(i_val)
-                target = images[img_i]
+                target = np.multiply((1./255), images[img_i], dtype=np.float32)
+                
+                #scale down target image even more so it matches the rendered image
+                sh = target.shape
+                target = target.reshape(sh[0] // rf, rf, sh[1] // rf, rf, 3).mean(3).mean(1)
+                
                 pose = poses[img_i, :3, :4]
-
-                rgb, disp, acc, extras = render(H, W, fxfycxcy[img_i], chunk=args.chunk, c2w=pose,
+                    
+                H_r = H // rf
+                W_r = W // rf
+                fxfycxcy_r = fxfycxcy / rf
+                
+                rgb, disp, acc, extras = render(H_r, W_r, fxfycxcy_r[img_i], chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
 
                 psnr = mse2psnr(img2mse(rgb, target))
                 
                 # Save out the validation image for Tensorboard-free monitoring
                 testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
-                if i==0:
-                    os.makedirs(testimgdir, exist_ok=True)
+                os.makedirs(testimgdir, exist_ok=True)
                 imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
 
                 with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):

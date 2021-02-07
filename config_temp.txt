@@ -3,7 +3,6 @@ basedir = /home/ec2-user/SageMaker/lbx-nerf/logs
 datadir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/sl2
 dataset_type = llff
 
-factor = 8
 llffhold = 8
 
 N_rand = 1024
