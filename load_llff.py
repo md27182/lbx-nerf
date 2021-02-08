@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 from tqdm import tqdm
 import random
@@ -89,16 +90,23 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, su
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
     
-    intrinsics = np.load(basedir + '/cam_mtx_list.npy')
-    intrinsics = intrinsics / factor
+    intrinsics = np.load(basedir + '/calibration_data/cam_mtx_list.npy')
+    intr_poses = np.zeros((3240,) + intrinsics.shape[1:])
     fxfycxcy = np.zeros((3240, 4))
+    
+    distortions = np.load(basedir + '/calibration_data/cam_dist_list.npy')
+    dist_poses = np.zeros((3240,) + distortions.shape[1:])
+    
     for i in range(3240):
         row = i // 120
         fxfycxcy[i,:] = np.array([intrinsics[row, 0, 0], intrinsics[row, 1, 1], intrinsics[row, 0, 2], intrinsics[row, 1, 2]])
+        dist_poses[i] = distortions[row]
+        intr_poses[i] = intrinsics[row]
     
-        
+    fxfycxcy = fxfycxcy * (1./factor)
+    
     indices_subset = []
-        
+    
     if subset_size is not None:
         assert len(imgfiles) == 3240
         # values were taken from mike's even spacing calculator script
@@ -115,6 +123,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, su
     poses = poses[:,:,indices_subset]
     bds = bds[:,indices_subset]
     fxfycxcy = fxfycxcy[indices_subset,:]
+    dist_poses = dist_poses[indices_subset]
+    intr_poses = intr_poses[indices_subset]
     imgfiles = [imgfiles[i] for i in indices_subset]
     
     if not load_imgs:
@@ -129,7 +139,9 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, su
     imgs = np.zeros((sh[0], sh[1], 3, subset_size), dtype=np.uint8)
     for i, f in enumerate(tqdm(imgfiles)):
         # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
-        imgs[...,i] = (imread(f)[...,:3]).reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
+        img = imread(f)[...,:3]
+        img = cv2.undistort(img, intr_poses[i], dist_poses[i])
+        imgs[...,i] = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
         
 #     imgs = imgs = [(imread(f)[...,:3]).astype(np.uint8) for f in imgfiles]
 #     imgs = np.stack(imgs, -1)  

@@ -568,6 +568,9 @@ def config_parser():
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
+    
+    parser.add_argument("--num_iters",   type=int, default=50000,
+                        help='frequency of render_poses video saving')
 
     return parser
 
@@ -581,6 +584,12 @@ def train(_args):
         print('Fixing random seed', args.random_seed)
         np.random.seed(args.random_seed)
         tf.compat.v1.set_random_seed(args.random_seed)
+        
+    # Create nerf model
+    render_kwargs_train, render_kwargs_test, start_iter, grad_vars, models = create_nerf(
+        args)
+    end_iter = ((start_iter + args.num_iters) // args.i_weights) * args.i_weights
+    print('iterating from', start_iter, 'to', end_iter)
 
     # Load data
     ### lbx start
@@ -677,9 +686,6 @@ def train(_args):
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
-    # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
-        args)
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
@@ -699,7 +705,7 @@ def train(_args):
             images = None
 
         testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format(
-            'test' if args.render_test else 'path', start))
+            'test' if args.render_test else 'path', start_iter))
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
@@ -720,7 +726,7 @@ def train(_args):
     models['optimizer'] = optimizer
 
     global_step = tf.compat.v1.train.get_or_create_global_step()
-    global_step.assign(start)
+    global_step.assign(start_iter)
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
@@ -758,7 +764,7 @@ def train(_args):
         print('done')
         i_batch = 0
 
-    N_iters = 50000
+        
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -769,7 +775,7 @@ def train(_args):
         os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
 
-    for i in range(start, N_iters):
+    for i in range(start_iter, end_iter + 1):
         time0 = time.time()
 
         # Sample random ray batch
