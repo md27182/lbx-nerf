@@ -585,6 +585,20 @@ def train(_args):
         np.random.seed(args.random_seed)
         tf.compat.v1.set_random_seed(args.random_seed)
         
+    # Create log dir and copy the config file
+    basedir = args.basedir
+    expname = args.expname
+    os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+    f = os.path.join(basedir, expname, 'args.txt')
+    with open(f, 'w') as file:
+        for arg in sorted(vars(args)):
+            attr = getattr(args, arg)
+            file.write('{} = {}\n'.format(arg, attr))
+    if args.config is not None:
+        f = os.path.join(basedir, expname, 'config.txt')
+        with open(f, 'w') as file:
+            file.write(open(args.config, 'r').read())
+        
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start_iter, grad_vars, models = create_nerf(
         args)
@@ -671,20 +685,6 @@ def train(_args):
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
-
-    # Create log dir and copy the config file
-    basedir = args.basedir
-    expname = args.expname
-    os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-    f = os.path.join(basedir, expname, 'args.txt')
-    with open(f, 'w') as file:
-        for arg in sorted(vars(args)):
-            attr = getattr(args, arg)
-            file.write('{} = {}\n'.format(arg, attr))
-    if args.config is not None:
-        f = os.path.join(basedir, expname, 'config.txt')
-        with open(f, 'w') as file:
-            file.write(open(args.config, 'r').read())
 
 
     bds_dict = {
