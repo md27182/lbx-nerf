@@ -1,6 +1,7 @@
-expname = sl2
+expname = hat
 basedir = /home/ec2-user/SageMaker/lbx-nerf/logs
-datadir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/sl2
+datadir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/hat
+bgimgdir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/bg001/images
 dataset_type = llff
 
 llffhold = 8

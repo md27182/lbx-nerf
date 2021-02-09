@@ -62,7 +62,7 @@ def _minify(basedir, factors=[], resolutions=[]):
         
         
         
-def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, subset_size=None):
+def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, subset_size=None, bgimgdir=None):
     
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
@@ -83,6 +83,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, su
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
+    
+    bgimgfiles = [os.path.join(bgimgdir, f) for f in sorted(os.listdir(bgimgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     
     # overwrite h,w,f in all poses
     sh = imageio.imread(imgfiles[0]).shape
@@ -126,6 +128,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, su
     dist_poses = dist_poses[indices_subset]
     intr_poses = intr_poses[indices_subset]
     imgfiles = [imgfiles[i] for i in indices_subset]
+    bgimgfiles = [bgimgfiles[i] for i in indices_subset]
     
     if not load_imgs:
         return poses, bds
@@ -137,17 +140,22 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, su
             return imageio.imread(f)
     
     imgs = np.zeros((sh[0], sh[1], 3, subset_size), dtype=np.uint8)
-    for i, f in enumerate(tqdm(imgfiles)):
+    bgs = np.zeros((sh[0], sh[1], 3, subset_size), dtype=np.uint8)
+    for i in tqdm(range(subset_size)):
         # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
-        img = imread(f)[...,:3]
+        img = imread(imgfiles[i])[...,:3]
         img = cv2.undistort(img, intr_poses[i], dist_poses[i])
         imgs[...,i] = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
+        
+        bgimg = imread(bgimgfiles[i])[...,:3]
+        bgimg = cv2.undistort(bgimg, intr_poses[i], dist_poses[i])
+        bgs[...,i] = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
         
 #     imgs = imgs = [(imread(f)[...,:3]).astype(np.uint8) for f in imgfiles]
 #     imgs = np.stack(imgs, -1)  
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
-    return poses, bds, imgs, fxfycxcy
+    return poses, bds, imgs, fxfycxcy, bgs
 
     
             
@@ -272,16 +280,17 @@ def spherify_poses(poses, bds):
     return poses_reset, new_poses, bds
     
 
-def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False, subset_size=None):
+def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=False, path_zflat=False, subset_size=None, bgimgdir=None):
     
 
-    poses, bds, imgs, fxfycxcy = _load_data(basedir, factor=factor, subset_size=subset_size) # factor=8 downsamples original imgs by 8x
+    poses, bds, imgs, fxfycxcy, bgs = _load_data(basedir, factor=factor, subset_size=subset_size, bgimgdir=bgimgdir) # factor=8 downsamples original imgs by 8x
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
     imgs = np.moveaxis(imgs, -1, 0)
+    bgs = np.moveaxis(bgs, -1, 0)
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
     
     # Rescale if bd_factor is provided
@@ -335,7 +344,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
 
     c2w = poses_avg(poses)
     print('Data:')
-    print(poses.shape, imgs.shape, bds.shape)
+    print(poses.shape, imgs.shape, bgs.shape, bds.shape)
     
     dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
     i_test = np.argmin(dists)
@@ -343,7 +352,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     
     poses = poses.astype(np.float32)
 
-    return imgs, poses, bds, render_poses, i_test, fxfycxcy
+    return imgs, poses, bds, render_poses, i_test, fxfycxcy, bgs
 
 
 

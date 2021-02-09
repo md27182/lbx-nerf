@@ -49,6 +49,7 @@ def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
                 N_samples,
+                bg=None,
                 retraw=False,
                 lindisp=False,
                 perturb=0.,
@@ -90,13 +91,14 @@ def render_rays(ray_batch,
         sample.
     """
 
-    def raw2outputs(raw, z_vals, rays_d):
+    def raw2outputs(raw, z_vals, rays_d, bg=None):
         """Transforms model's predictions to semantically meaningful values.
 
         Args:
           raw: [num_rays, num_samples along ray, 4]. Prediction from model.
           z_vals: [num_rays, num_samples along ray]. Integration time.
           rays_d: [num_rays, 3]. Direction of each ray.
+          bg: [num_rays, 3]. RGB color of background at the end of each ray.
 
         Returns:
           rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
@@ -156,9 +158,11 @@ def render_rays(ray_batch,
         # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
         acc_map = tf.reduce_sum(weights, -1)
 
-        # To composite onto a white background, use the accumulated alpha map.
+        # To composite onto a background, use the accumulated alpha map.
         if white_bkgd:
-            rgb_map = rgb_map + (1.-acc_map[..., None])
+            rgb_map = rgb_map + (1. - acc_map[..., None])
+        elif bg is not None:
+            rgb_map = rgb_map + (1. - acc_map[..., None]) * bg
 
         return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -205,7 +209,7 @@ def render_rays(ray_batch,
     # Evaluate model at each point.
     raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-        raw, z_vals, rays_d)
+        raw, z_vals, rays_d, bg)
 
     if N_importance > 0:
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
@@ -226,7 +230,7 @@ def render_rays(ray_batch,
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, rays_d)
+            raw, z_vals, rays_d, bg)
 
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
     if retraw:
@@ -243,11 +247,11 @@ def render_rays(ray_batch,
     return ret
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, bg=None, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = render_rays(rays_flat[i:i+chunk], bg=bg, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -259,7 +263,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 
 def render(H, W, fxfycxcy,
            chunk=1024*32, rays=None, c2w=None, ndc=True,
-           near=0., far=1.,
+           near=0., far=1., bg=None,
            use_viewdirs=False, c2w_staticcam=None,
            **kwargs):
     """Render rays
@@ -325,7 +329,7 @@ def render(H, W, fxfycxcy,
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, bg=bg, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
@@ -469,6 +473,8 @@ def config_parser():
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str,
                         default='./data/llff/fern', help='input data directory')
+    parser.add_argument("--bgimgdir", type=str,
+                        default=None, help='directory where background-only images are stored')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8,
@@ -569,7 +575,7 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
     
-    parser.add_argument("--num_iters",   type=int, default=50000,
+    parser.add_argument("--train_until",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
     return parser
@@ -602,7 +608,11 @@ def train(_args):
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start_iter, grad_vars, models = create_nerf(
         args)
-    end_iter = ((start_iter + args.num_iters) // args.i_weights) * args.i_weights
+
+    end_iter = args.train_until
+    if start_iter > args.train_until:
+        print('already trained past ', args.train_until)
+        return
     print('iterating from', start_iter, 'to', end_iter)
 
     # Load data
@@ -610,12 +620,12 @@ def train(_args):
     if args.factor == 1:
         subset_size = 100
     elif args.factor == 2:
-        subset_size = 712
+        subset_size = 324 #712
     else:
         subset_size = None
         
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test, fxfycxcy = load_llff_data(args.datadir, args.factor, recenter=True, spherify=args.spherify, subset_size=subset_size) # removed bd_factor=.75, added subset_size parameter
+        images, poses, bds, render_poses, i_test, fxfycxcy, bg_images = load_llff_data(args.datadir, args.factor, recenter=True, spherify=args.spherify, subset_size=subset_size, bgimgdir=args.bgimgdir) # removed bd_factor=.75, added subset_size parameter
         
         ### lbx end
         
@@ -800,6 +810,7 @@ def train(_args):
             # Random from one image
             img_i = np.random.choice(i_train)
             target = np.multiply((1./255), images[img_i], dtype=np.float32)
+            bg = np.multiply((1./255), bg_images[img_i], dtype=np.float32)
             pose = poses[img_i, :3, :4]
 
 #             time1 = time.time() - time0 ### xxx
@@ -832,6 +843,7 @@ def train(_args):
                 rays_d = tf.gather_nd(rays_d, select_inds)
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
+                bg_s = tf.gather_nd(bg, select_inds)
 
 #                 time4 = time.time() - time0 ### xxx
 
@@ -842,7 +854,7 @@ def train(_args):
             # Make predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
                 H, W, None, chunk=args.chunk, rays=batch_rays,
-                verbose=i < 10, retraw=True, **render_kwargs_train)
+                verbose=i < 10, bg=bg_s, retraw=True, **render_kwargs_train)
             
 #             time5 = time.time() - time0 ### xxx
 
