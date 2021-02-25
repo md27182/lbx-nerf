@@ -2,7 +2,7 @@ expname = helicopter
 basedir = /home/ec2-user/SageMaker/lbx-nerf/logs
 datadir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/helicopter
 bgimgdir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/bg001/images
-dataset_type = llff
+dataset_type = lbx
 
 llffhold = 8
 

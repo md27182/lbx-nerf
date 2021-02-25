@@ -5,6 +5,7 @@ import random
 import os
 import imageio
 from tqdm import tqdm
+from run_nerf_helpers import *
 
 def normalize(x):
     return x / np.linalg.norm(x)
@@ -130,7 +131,7 @@ def select_camera_indices(indices_path):
     indices = []
     # values were taken from mike's even spacing calculator script
     row_spacing = np.array([20, 9, 6, 5, 4, 3, 3, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
-    for i in range(len(row_samples)):
+    for i in range(len(row_spacing)):
         if i == 0:
             offset = 0
         else:
@@ -144,7 +145,7 @@ def select_camera_indices(indices_path):
 
 
 
-def load_lbx_data(basedir, num_rays, factor=2, recenter=True, bd_factor=.75, spherify=False, path_zflat=False, subset_size=None, bgimgdir=None):
+def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor=2, recenter=True, spherify=True, path_zflat=False):
     
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
@@ -183,6 +184,7 @@ def load_lbx_data(basedir, num_rays, factor=2, recenter=True, bd_factor=.75, sph
     
     fxfycxcy = fxfycxcy * (1./factor)
     
+    
     # sample from subset of evenly spaced camera poses
     indices_path = os.path.join(basedir, 'camera_indices.npy')
     if os.path.exists(indices_path):
@@ -190,98 +192,123 @@ def load_lbx_data(basedir, num_rays, factor=2, recenter=True, bd_factor=.75, sph
     else:
         indices_subset = select_camera_indices(indices_path)
     
+    
     # subset each of the parallel arrays
-    poses = poses[:,:,indices_subset]
-    bds = bds[:,indices_subset]
-    fxfycxcy = fxfycxcy[indices_subset,:]
+#     poses = poses[:,:,indices_subset]
+#     bds = bds[:,indices_subset]
+#     fxfycxcy = fxfycxcy[indices_subset,:]
     
-    dist_poses = dist_poses[indices_subset]
-    intr_poses = intr_poses[indices_subset]
+#     dist_poses = dist_poses[indices_subset]
+#     intr_poses = intr_poses[indices_subset]
     
-    imgfiles = [imgfiles[i] for i in indices_subset]
-    bgimgfiles = [bgimgfiles[i] for i in indices_subset]
+#     imgfiles = [imgfiles[i] for i in indices_subset]
+#     bgimgfiles = [bgimgfiles[i] for i in indices_subset]
     
-    if not load_imgs:
-        return poses, bds
-    
-    ray_o_d = np.zeros(
-    imgs = np.zeros((sh[0], sh[1], 3, indices_subset.size), dtype=np.uint8)
-    bgs = np.zeros((sh[0], sh[1], 3, indices_subset.size), dtype=np.uint8)
-    
-    for i in tqdm(range(subset_size)):
-        # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
-        img = imageio.imread(imgfiles[i])[...,:3]
-        img = cv2.undistort(img, intr_poses[i], dist_poses[i])
-        imgs[...,i] = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
-        
-        bgimg = imageio.imread(bgimgfiles[i])[...,:3]
-        bgimg = cv2.undistort(bgimg, intr_poses[i], dist_poses[i])
-        bgs[...,i] = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1).astype(np.uint8)
-        
-#     imgs = imgs = [(imread(f)[...,:3]).astype(np.uint8) for f in imgfiles]
-#     imgs = np.stack(imgs, -1)  
-    
-    print('Loaded image data', imgs.shape, poses[:,-1,0])
-    return poses, bds, imgs, fxfycxcy, bgs
-###
-    
-
-    poses, bds, imgs, fxfycxcy, bgs = _load_data(basedir, factor=factor, subset_size=subset_size, bgimgdir=bgimgdir) # factor=8 downsamples original imgs by 8x
-    print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
-    imgs = np.moveaxis(imgs, -1, 0)
-    bgs = np.moveaxis(bgs, -1, 0)
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
     
-    # Rescale if bd_factor is provided
-    sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)
-    poses[:,:3,3] *= sc
-    bds *= sc
+    rays_od = np.zeros((num_rays, 2, 3), dtype=np.float32) # [ray_number, origin or direction, xyz]
+    rays_rgb = np.zeros((num_rays, 2, 3), dtype=np.uint8) # [ray_number, foreground or background, rgb]
+    
+    num_val_imgs = np.ceil(indices_subset.size / holdout).astype(np.int32) # total number of validation images
+    val_imgs = np.zeros((sh[0], sh[1], 3, num_val_imgs), dtype=np.uint8)
+    val_bgs = np.zeros((sh[0], sh[1], 3, num_val_imgs), dtype=np.uint8)
+    val_indices = np.zeros(num_val_imgs)
+    # val_poses = np.zeros(((num_val_imgs,) + poses.shape[1:]))
+    
+    num_training_images = indices_subset.size - num_val_imgs
+    rays_per_img = np.ceil(num_rays / num_training_images).astype(np.int32)
+    if rays_per_img > (sh[0] * sh[1]):
+        rays_per_img = sh[0] * sh[1]
+    
+    t_imgs_counter = 0
+    for i, index in tqdm(enumerate(indices_subset)):
+        # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
+        img = imageio.imread(imgfiles[index])[...,:3]
+        img = cv2.undistort(img, intr_poses[index], dist_poses[index])
+        img = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
+        
+        bgimg = imageio.imread(bgimgfiles[index])[...,:3]
+        bgimg = cv2.undistort(bgimg, intr_poses[index], dist_poses[index])
+        bgimg = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
+        
+        pose = poses[index, :3, :4]
+
+        # check if this image should be a validation image
+        if i % holdout == 0:
+            val_imgs[..., i // holdout] = img.astype(np.uint8)
+            val_bgs[..., i // holdout] = bgimg.astype(np.uint8)
+            val_indices[i // holdout] = index
+            continue
+        
+        h_img, w_img = img.shape[:2]
+        h_bin, w_bin = 200, 200
+        
+        val_thresh = 10
+        count_thresh = 0.05 * (3 * h_bin * w_bin)
+
+        # count the number of r,g, and b values in each bin that exceed val_thresh
+        diff = img - bgimg
+        matte = np.abs(diff) > val_thresh
+        matte = matte.reshape(h_img // h_bin, h_bin, w_img // w_bin, w_bin, 3).sum(3).sum(1).sum(-1)
+        # find the bins for which more than 5% of the pixels exceed val_thresh
+        matte = matte > count_thresh
+
+        # scale the matte back up to h_img, w_img
+        matte = np.repeat(np.repeat(matte, h_bin, axis=0), w_bin, axis=1)
+        
+        
+        # get rays from image
+        rays_o, rays_d = get_rays(h_img, w_img, fxfycxcy[index], pose)
+        
+        ray_numbers = range(t_imgs_counter * rays_per_img, (t_imgs_counter + 1) * rays_per_img)
+
+        coords = tf.stack(tf.meshgrid(tf.range(h_img), tf.range(w_img), indexing='ij'), -1)
+        good_coords = tf.boolean_mask(coords, matte)
+        good_coords = tf.reshape(good_coords, [-1, 2])
+
+        select_inds = np.random.choice(good_coords.shape[0], size=[rays_per_img], replace=False)
+        select_inds = tf.gather_nd(good_coords, select_inds[:, tf.newaxis])
+        
+        rays_od[ray_numbers, 0, :] = tf.gather_nd(rays_o, select_inds)
+        rays_od[ray_numbers, 1, :] = tf.gather_nd(rays_d, select_inds)
+#         rays_o = tf.gather_nd(rays_o, select_inds)
+#         rays_d = tf.gather_nd(rays_d, select_inds)
+#         batch_rays = tf.stack([rays_o, rays_d], 0)
+#         target_s = tf.gather_nd(target, select_inds)
+#         bg_s = tf.gather_nd(bg, select_inds)
+        rays_rgb[ray_numbers, 0, :] = tf.gather_nd(img.astype(np.uint8), select_inds)
+        rays_rgb[ray_numbers, 1, :] = tf.gather_nd(bgimg.astype(np.uint8), select_inds)
+        
+        if t_imgs_counter > 10:
+            break
+        t_imgs_counter += 1
+        
+        
+    exit()
+#     imgs = imgs = [(imread(f)[...,:3]).astype(np.uint8) for f in imgfiles]
+#     imgs = np.stack(imgs, -1)  
+
+    # subset the poses, bounds, and intrinsic values to only include the validation set
+    val_poses = poses[:,:,val_indices]
+    val_bds = bds[:,val_indices]
+    val_fxfycxcy = fxfycxcy[val_indices,:]
+    
+    print('Loaded image data', imgs.shape, poses[:,-1,0])
+###
+
+
+    poses, bds, imgs, fxfycxcy, bgs = _load_data(basedir, factor=factor, subset_size=subset_size, bgimgdir=bgimgdir) # factor=8 downsamples original imgs by 8x
+    print('Loaded', basedir, bds.min(), bds.max())
     
     if recenter:
         poses = recenter_poses(poses)
         
     if spherify:
-        poses, render_poses, bds = spherify_poses(poses, bds)
-
-    else:
-        
-        c2w = poses_avg(poses)
-        print('recentered', c2w.shape)
-        print(c2w[:3,:4])
-
-        ## Get spiral
-        # Get average pose
-        up = normalize(poses[:, :3, 1].sum(0))
-
-        # Find a reasonable "focus depth" for this dataset
-        close_depth, inf_depth = bds.min()*.9, bds.max()*5.
-        dt = .75
-        mean_dz = 1./(((1.-dt)/close_depth + dt/inf_depth))
-        focal = mean_dz
-
-        # Get radii for spiral path
-        shrink_factor = .8
-        zdelta = close_depth * .2
-        tt = poses[:,:3,3] # ptstocam(poses[:3,3,:].T, c2w).T
-        rads = np.percentile(np.abs(tt), 90, 0)
-        c2w_path = c2w
-        N_views = 120
-        N_rots = 2
-        if path_zflat:
-#             zloc = np.percentile(tt, 10, 0)[2]
-            zloc = -close_depth * .1
-            c2w_path[:3,3] = c2w_path[:3,3] + zloc * c2w_path[:3,2]
-            rads[2] = 0.
-            N_rots = 1
-            N_views/=2
-
-        # Generate poses for spiral path
-        render_poses = render_path_spiral(c2w_path, up, rads, focal, zdelta, zrate=.5, rots=N_rots, N=N_views)
-        
+        poses, render_poses, bds = spherify_poses(poses, bds) 
         
     render_poses = np.array(render_poses).astype(np.float32)
 
@@ -295,4 +322,4 @@ def load_lbx_data(basedir, num_rays, factor=2, recenter=True, bd_factor=.75, sph
     
     poses = poses.astype(np.float32)
 
-    return imgs, poses, bds, render_poses, i_test, fxfycxcy, bgs
+    return val_imgs, val_bgs, val_poses, val_fxfycxcy, val_bds, render_poses, i_test

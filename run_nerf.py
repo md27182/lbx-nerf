@@ -10,6 +10,7 @@ import random
 import time
 from run_nerf_helpers import *
 from load_llff import load_llff_data
+from load_lbx import load_lbx_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 
@@ -623,6 +624,36 @@ def train(_args):
         subset_size = 324 #712
     else:
         subset_size = None
+        
+    if args.dataset_type == 'lbx':
+        val_imgs, val_bgs, val_poses, val_fxfycxcy, val_bds, render_poses, i_test = load_lbx_data(args.datadir, args.bgimgdir, 5000000, args.llffhold, factor=2)
+        
+        hwf = poses[0, :3, -1]
+        print('[lbx_debug]--> hwf', hwf[0], hwf[1], hwf[2])###
+        
+        poses = poses[:, :3, :4]
+        print('Loaded llff', images.shape,
+              render_poses.shape, hwf, args.datadir)
+        if not isinstance(i_test, list):
+            i_test = [i_test]
+
+        if args.llffhold > 0:
+            print('Auto LLFF holdout,', args.llffhold)
+            i_test = np.arange(images.shape[0])[::args.llffhold]
+
+        i_val = i_test
+        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
+                            (i not in i_test and i not in i_val)])
+
+        print('DEFINING BOUNDS')
+        if args.no_ndc:
+            near = tf.reduce_min(bds) * .9
+            far = tf.reduce_max(bds) * 1.
+        else:
+            near = 0.
+            far = 1.
+        print('NEAR FAR', near, far)
+        
         
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test, fxfycxcy, bg_images = load_llff_data(args.datadir, args.factor, recenter=True, spherify=args.spherify, subset_size=subset_size, bgimgdir=args.bgimgdir) # removed bd_factor=.75, added subset_size parameter
