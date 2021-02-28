@@ -576,8 +576,11 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
     
-    parser.add_argument("--train_until",   type=int, default=50000,
-                        help='frequency of render_poses video saving')
+    parser.add_argument("--iters",   type=int, default=500000,
+                        help='total number of training iterations')
+    parser.add_argument("--reload_data",   action='store_true',
+                        help='create new preprocessed.npz file')
+    
 
     return parser
 
@@ -610,40 +613,26 @@ def train(_args):
     render_kwargs_train, render_kwargs_test, start_iter, grad_vars, models = create_nerf(
         args)
 
-    end_iter = args.train_until
-    if start_iter > args.train_until:
-        print('already trained past ', args.train_until)
-        return
-    print('iterating from', start_iter, 'to', end_iter)
-
+    end_iter = args.iters
+    N_rand = args.N_rand
+    
     # Load data
-    ### lbx start
-    if args.factor == 1:
-        subset_size = 100
-    elif args.factor == 2:
-        subset_size = 324 #712
-    else:
-        subset_size = None
-        
     if args.dataset_type == 'lbx':
-        val_imgs, val_bgs, val_poses, val_fxfycxcy, val_bds, render_poses, i_test = load_lbx_data(args.datadir, args.bgimgdir, 5000000, args.llffhold, factor=2)
         
-        hwf = poses[0, :3, -1]
+        preprocessed_path = os.path.join(args.datadir, 'preprocessed.npz')
+        if os.path.isfile(preprocessed_path) and not args.reload_data:
+            npz = np.load(preprocessed_path)
+            rays_od, rays_rgb, val_imgs, val_poses, val_fxfycxcy, render_poses, bds = [npz[i] for i in npz.files]
+        else:
+            rays_od, rays_rgb, val_imgs, val_poses, val_fxfycxcy, render_poses, bds = load_lbx_data(args.datadir, args.bgimgdir, end_iter*N_rand, args.llffhold, args.factor)
+            np.savez(preprocessed_path, rays_od, rays_rgb, val_imgs, val_poses, val_fxfycxcy, render_poses, bds)
+        
+        hwf = val_poses[0, :3, -1]
         print('[lbx_debug]--> hwf', hwf[0], hwf[1], hwf[2])###
         
-        poses = poses[:, :3, :4]
-        print('Loaded llff', images.shape,
-              render_poses.shape, hwf, args.datadir)
-        if not isinstance(i_test, list):
-            i_test = [i_test]
-
-        if args.llffhold > 0:
-            print('Auto LLFF holdout,', args.llffhold)
-            i_test = np.arange(images.shape[0])[::args.llffhold]
-
-        i_val = i_test
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
-                            (i not in i_test and i not in i_val)])
+#         poses = poses[:, :3, :4]
+#         print('Loaded llff', images.shape,
+#               render_poses.shape, hwf, args.datadir)
 
         print('DEFINING BOUNDS')
         if args.no_ndc:
@@ -654,67 +643,6 @@ def train(_args):
             far = 1.
         print('NEAR FAR', near, far)
         
-        
-    if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test, fxfycxcy, bg_images = load_llff_data(args.datadir, args.factor, recenter=True, spherify=args.spherify, subset_size=subset_size, bgimgdir=args.bgimgdir) # removed bd_factor=.75, added subset_size parameter
-        
-        ### lbx end
-        
-        hwf = poses[0, :3, -1]
-        print('[lbx_debug]--> hwf', hwf[0], hwf[1], hwf[2])###
-        
-        poses = poses[:, :3, :4]
-        print('Loaded llff', images.shape,
-              render_poses.shape, hwf, args.datadir)
-        if not isinstance(i_test, list):
-            i_test = [i_test]
-
-        if args.llffhold > 0:
-            print('Auto LLFF holdout,', args.llffhold)
-            i_test = np.arange(images.shape[0])[::args.llffhold]
-
-        i_val = i_test
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
-                            (i not in i_test and i not in i_val)])
-
-        print('DEFINING BOUNDS')
-        if args.no_ndc:
-            near = tf.reduce_min(bds) * .9
-            far = tf.reduce_max(bds) * 1.
-        else:
-            near = 0.
-            far = 1.
-        print('NEAR FAR', near, far)
-
-    elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape,
-              render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        near = 2.
-        far = 6.
-
-        if args.white_bkgd:
-            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
-        else:
-            images = images[..., :3]
-
-    elif args.dataset_type == 'deepvoxels':
-
-        images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
-                                                                 basedir=args.datadir,
-                                                                 testskip=args.testskip)
-
-        print('Loaded deepvoxels', images.shape,
-              render_poses.shape, hwf, args.datadir)
-        i_train, i_val, i_test = i_split
-
-        hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
-
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -725,7 +653,7 @@ def train(_args):
     hwf = [H, W, focal]
 
     if args.render_test:
-        render_poses = np.array(poses[i_test])
+        render_poses = np.array(val_poses)
 
 
     bds_dict = {
@@ -740,7 +668,7 @@ def train(_args):
         print('RENDER ONLY')
         if args.render_test:
             # render_test switches to test poses
-            images = np.multiply((1./255), images[i_test], dtype=np.float32)
+            images = np.multiply((1./255), val_imgs, dtype=np.float32)
         else:
             # Default is smoother render_poses path
             images = None
@@ -770,46 +698,52 @@ def train(_args):
     global_step.assign(start_iter)
 
     # Prepare raybatch tensor if batching random rays
-    N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
-        # For random ray batching.
-        #
-        # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
-        # interpreted as,
-        #   axis=0: ray origin in world space
-        #   axis=1: ray direction in world space
-        #   axis=2: observed RGB color of pixel
-        print('get rays')
-        # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
-        # for each pixel in the image. This stack() adds a new dimension.
+#         # For random ray batching.
+#         #
+#         # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
+#         # interpreted as,
+#         #   axis=0: ray origin in world space
+#         #   axis=1: ray direction in world space
+#         #   axis=2: observed RGB color of pixel
+#         print('get rays')
+#         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
+#         # for each pixel in the image. This stack() adds a new dimension.
         
-        ### lbx start
-        rays = [get_rays_np(H, W, fxfycxcy[i], poses[i, :3, :4]) for i in range(poses.shape[0])]
-        # rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        ### lbx end
+#         ### lbx start
+#         rays = [get_rays_np(H, W, fxfycxcy[i], poses[i, :3, :4]) for i in range(poses.shape[0])]
+#         # rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+#         ### lbx end
         
-        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
-        print('done, concats')
-        # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
-        # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = np.stack([rays_rgb[i]
-                             for i in i_train], axis=0)  # train images only
-        # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
-        rays_rgb = rays_rgb.astype(np.float32)
-        print('shuffle rays')
-        np.random.shuffle(rays_rgb)
+#         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
+#         print('done, concats')
+#         # [N, ro+rd+rgb, H, W, 3]
+#         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+#         # [N, H, W, ro+rd+rgb, 3]
+#         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+#         rays_rgb = np.stack([rays_rgb[i]
+#                              for i in i_train], axis=0)  # train images only
+#         # [(N-1)*H*W, ro+rd+rgb, 3]
+#         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+#         rays_rgb = rays_rgb.astype(np.float32)
+#         print('shuffle rays')
+#         np.random.shuffle(rays_rgb)
+#         print('done')
+#         i_batch = 0
+        
+        print('shuffling rays')
+        shuffler = np.random.permutation(rays_rgb.shape[0])
+        rays_rgb = rays_rgb[shuffler]
+        rays_od = rays_od[shuffler]
         print('done')
         i_batch = 0
 
         
     print('Begin')
-    print('TRAIN views are', i_train)
-    print('TEST views are', i_test)
-    print('VAL views are', i_val)
+#     print('TRAIN views are', i_train)
+#     print('TEST views are', i_test)
+#     print('VAL views are', i_val)
 
     # Summary writers
     writer = tf.contrib.summary.create_file_writer(
@@ -822,59 +756,71 @@ def train(_args):
         # Sample random ray batch
         
         if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
-            batch = tf.transpose(batch, [1, 0, 2])
+#             # Random over all images
+#             batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
+#             batch = tf.transpose(batch, [1, 0, 2])
 
-            # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
-            # target_s[n, rgb] = example_id, observed color.
-            batch_rays, target_s = batch[:2], batch[2]
+#             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
+#             # target_s[n, rgb] = example_id, observed color.
+#             batch_rays, target_s = batch[:2], batch[2]
+            
+            batch_rays = rays_od[i_batch:i_batch+N_rand]
+            batch_rays = tf.transpose(batch_rays, [1, 0, 2])
+            target_s = rays_rgb[i_batch:i_batch+N_rand, 0, :]
+            bg_s = rays_rgb[i_batch:i_batch+N_rand, 1, :]
+            
+            target_s = np.multiply((1./255), target_s, dtype=np.float32)
+            bg_s = np.multiply((1./255), bg_s, dtype=np.float32)
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
-                np.random.shuffle(rays_rgb)
+                print('re-shuffling rays')
+                shuffler = np.random.permutation(rays_rgb.shape[0])
+                rays_rgb = rays_rgb[shuffler]
+                rays_od = rays_od[shuffler]
+                print('done')
                 i_batch = 0
             
 #             time1 = time.time() - time0 ### xxx
         
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = np.multiply((1./255), images[img_i], dtype=np.float32)
-            bg = np.multiply((1./255), bg_images[img_i], dtype=np.float32)
-            pose = poses[img_i, :3, :4]
+#         else:
+#             # Random from one image
+#             img_i = np.random.choice(i_train)
+#             target = np.multiply((1./255), images[img_i], dtype=np.float32)
+#             bg = np.multiply((1./255), bg_images[img_i], dtype=np.float32)
+#             pose = poses[img_i, :3, :4]
 
-#             time1 = time.time() - time0 ### xxx
+# #             time1 = time.time() - time0 ### xxx
 
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, fxfycxcy[img_i], pose)
+#             if N_rand is not None:
+#                 rays_o, rays_d = get_rays(H, W, fxfycxcy[img_i], pose)
 
-#                 time2 = time.time() - time0 ### xxx
+# #                 time2 = time.time() - time0 ### xxx
 
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = tf.stack(tf.meshgrid(
-                        tf.range(H//2 - dH, H//2 + dH), 
-                        tf.range(W//2 - dW, W//2 + dW), 
-                        indexing='ij'), -1)
-                    if i < 10:
-                        print('precrop', dH, dW, coords[0,0], coords[-1,-1])
-                else:
-                    coords = tf.stack(tf.meshgrid(
-                        tf.range(H), tf.range(W), indexing='ij'), -1)
-                coords = tf.reshape(coords, [-1, 2])
+#                 if i < args.precrop_iters:
+#                     dH = int(H//2 * args.precrop_frac)
+#                     dW = int(W//2 * args.precrop_frac)
+#                     coords = tf.stack(tf.meshgrid(
+#                         tf.range(H//2 - dH, H//2 + dH), 
+#                         tf.range(W//2 - dW, W//2 + dW), 
+#                         indexing='ij'), -1)
+#                     if i < 10:
+#                         print('precrop', dH, dW, coords[0,0], coords[-1,-1])
+#                 else:
+#                     coords = tf.stack(tf.meshgrid(
+#                         tf.range(H), tf.range(W), indexing='ij'), -1)
+#                 coords = tf.reshape(coords, [-1, 2])
 
-#                 time3 = time.time() - time0 ### xxx
+# #                 time3 = time.time() - time0 ### xxx
 
-                select_inds = np.random.choice(
-                    coords.shape[0], size=[N_rand], replace=False)
-                select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis])
-                rays_o = tf.gather_nd(rays_o, select_inds)
-                rays_d = tf.gather_nd(rays_d, select_inds)
-                batch_rays = tf.stack([rays_o, rays_d], 0)
-                target_s = tf.gather_nd(target, select_inds)
-                bg_s = tf.gather_nd(bg, select_inds)
+#                 select_inds = np.random.choice(
+#                     coords.shape[0], size=[N_rand], replace=False)
+#                 select_inds = tf.gather_nd(coords, select_inds[:, tf.newaxis])
+#                 rays_o = tf.gather_nd(rays_o, select_inds)
+#                 rays_d = tf.gather_nd(rays_d, select_inds)
+#                 batch_rays = tf.stack([rays_o, rays_d], 0)
+#                 target_s = tf.gather_nd(target, select_inds)
+#                 bg_s = tf.gather_nd(bg, select_inds)
 
 #                 time4 = time.time() - time0 ### xxx
 
@@ -949,15 +895,15 @@ def train(_args):
 #                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
 #                                  to8b(rgbs_still), fps=30, quality=8)
 
-        if i % args.i_testset == 0 and i > 0:
-            testsavedir = os.path.join(
-                basedir, expname, 'testset_{:06d}'.format(i))
-            os.makedirs(testsavedir, exist_ok=True)
-            print('test poses shape', poses[i_test].shape)
-            render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
-                        gt_imgs=np.multiply((1./255), images[i_test], dtype=np.float32),
-                        savedir=testsavedir)
-            print('Saved test set')
+#         if i % args.i_testset == 0 and i > 0:
+#             testsavedir = os.path.join(
+#                 basedir, expname, 'testset_{:06d}'.format(i))
+#             os.makedirs(testsavedir, exist_ok=True)
+#             print('test poses shape', poses[i_test].shape)
+#             render_path(poses[i_test], hwf, args.chunk, render_kwargs_test,
+#                         gt_imgs=np.multiply((1./255), images[i_test], dtype=np.float32),
+#                         savedir=testsavedir)
+#             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
 
@@ -978,18 +924,18 @@ def train(_args):
                 else:
                     rf = 1
                 
-                img_i = np.random.choice(i_val)
-                target = np.multiply((1./255), images[img_i], dtype=np.float32)
+                img_i = np.random.choice(range(val_poses.shape[0]))
+                target = np.multiply((1./255), val_imgs[img_i], dtype=np.float32)
                 
                 #scale down target image even more so it matches the rendered image
                 sh = target.shape
                 target = target.reshape(sh[0] // rf, rf, sh[1] // rf, rf, 3).mean(3).mean(1)
                 
-                pose = poses[img_i, :3, :4]
-                    
+                pose = val_poses[img_i, :3, :4]
+                
                 H_r = H // rf
                 W_r = W // rf
-                fxfycxcy_r = fxfycxcy / rf
+                fxfycxcy_r = val_fxfycxcy / rf
                 
                 rgb, disp, acc, extras = render(H_r, W_r, fxfycxcy_r[img_i], chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)

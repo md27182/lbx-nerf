@@ -126,7 +126,7 @@ def spherify_poses(poses, bds):
 
 
 # selects 2134 evenly spaced poses out of the full 3240
-def select_camera_indices(indices_path):
+def select_camera_indices():
     
     indices = []
     # values were taken from mike's even spacing calculator script
@@ -140,13 +140,15 @@ def select_camera_indices(indices_path):
         # print(''.join(['X' if x in indices else ' ' for x in range(i*120, (i+1)*120)]))
     
     indices_np = np.array(indices)
-    np.save(indices_path, indices_np)
+    # np.save(indices_path, indices_np)
     return indices_np
 
-
-
-def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor=2, recenter=True, spherify=True, path_zflat=False):
+#def _load_data(basedir, bgimgdir, num_rays, holdout, factor):
     
+
+
+def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor, recenter=True, spherify=True, path_zflat=False):
+        
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
     bds = poses_arr[:, -2:].transpose([1,0])
@@ -186,46 +188,39 @@ def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor=2, recenter=True,
     
     
     # sample from subset of evenly spaced camera poses
-    indices_path = os.path.join(basedir, 'camera_indices.npy')
-    if os.path.exists(indices_path):
-        indices_subset = np.load(indices_path)
-    else:
-        indices_subset = select_camera_indices(indices_path)
-    
-    
-    # subset each of the parallel arrays
-#     poses = poses[:,:,indices_subset]
-#     bds = bds[:,indices_subset]
-#     fxfycxcy = fxfycxcy[indices_subset,:]
-    
-#     dist_poses = dist_poses[indices_subset]
-#     intr_poses = intr_poses[indices_subset]
-    
-#     imgfiles = [imgfiles[i] for i in indices_subset]
-#     bgimgfiles = [bgimgfiles[i] for i in indices_subset]
-    
+    indices_subset = select_camera_indices()
     
     # Correct rotation matrix ordering and move variable dim to axis 0
     poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)
     
-    rays_od = np.zeros((num_rays, 2, 3), dtype=np.float32) # [ray_number, origin or direction, xyz]
-    rays_rgb = np.zeros((num_rays, 2, 3), dtype=np.uint8) # [ray_number, foreground or background, rgb]
+    if recenter:
+        poses = recenter_poses(poses)
+        
+    if spherify:
+        poses, render_poses, bds = spherify_poses(poses, bds) 
+        
+    poses = poses.astype(np.float32)
+    render_poses = np.array(render_poses).astype(np.float32)
     
     num_val_imgs = np.ceil(indices_subset.size / holdout).astype(np.int32) # total number of validation images
-    val_imgs = np.zeros((sh[0], sh[1], 3, num_val_imgs), dtype=np.uint8)
-    val_bgs = np.zeros((sh[0], sh[1], 3, num_val_imgs), dtype=np.uint8)
-    val_indices = np.zeros(num_val_imgs)
+    val_imgs = np.zeros((num_val_imgs, sh[0], sh[1], 3), dtype=np.uint8)
+    val_indices = np.zeros(num_val_imgs).astype(np.int32)
     # val_poses = np.zeros(((num_val_imgs,) + poses.shape[1:]))
     
     num_training_images = indices_subset.size - num_val_imgs
     rays_per_img = np.ceil(num_rays / num_training_images).astype(np.int32)
     if rays_per_img > (sh[0] * sh[1]):
         rays_per_img = sh[0] * sh[1]
+        
+    num_rays_to_load = num_training_images * rays_per_img
+    rays_od = np.zeros((num_rays_to_load, 2, 3), dtype=np.float32) # [ray_number, origin or direction, xyz]
+    rays_rgb = np.zeros((num_rays_to_load, 2, 3), dtype=np.uint8) # [ray_number, foreground or background, rgb]
     
     t_imgs_counter = 0
     for i, index in tqdm(enumerate(indices_subset)):
+        
         # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
         img = imageio.imread(imgfiles[index])[...,:3]
         img = cv2.undistort(img, intr_poses[index], dist_poses[index])
@@ -239,8 +234,7 @@ def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor=2, recenter=True,
 
         # check if this image should be a validation image
         if i % holdout == 0:
-            val_imgs[..., i // holdout] = img.astype(np.uint8)
-            val_bgs[..., i // holdout] = bgimg.astype(np.uint8)
+            val_imgs[i // holdout] = img.astype(np.uint8)
             val_indices[i // holdout] = index
             continue
         
@@ -250,7 +244,7 @@ def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor=2, recenter=True,
         val_thresh = 10
         count_thresh = 0.05 * (3 * h_bin * w_bin)
 
-        # count the number of r,g, and b values in each bin that exceed val_thresh
+        # count the number of r, g, and b diffs in each bin that exceed val_thresh
         diff = img - bgimg
         matte = np.abs(diff) > val_thresh
         matte = matte.reshape(h_img // h_bin, h_bin, w_img // w_bin, w_bin, 3).sum(3).sum(1).sum(-1)
@@ -275,51 +269,22 @@ def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor=2, recenter=True,
         
         rays_od[ray_numbers, 0, :] = tf.gather_nd(rays_o, select_inds)
         rays_od[ray_numbers, 1, :] = tf.gather_nd(rays_d, select_inds)
-#         rays_o = tf.gather_nd(rays_o, select_inds)
-#         rays_d = tf.gather_nd(rays_d, select_inds)
-#         batch_rays = tf.stack([rays_o, rays_d], 0)
-#         target_s = tf.gather_nd(target, select_inds)
-#         bg_s = tf.gather_nd(bg, select_inds)
+
         rays_rgb[ray_numbers, 0, :] = tf.gather_nd(img.astype(np.uint8), select_inds)
         rays_rgb[ray_numbers, 1, :] = tf.gather_nd(bgimg.astype(np.uint8), select_inds)
         
-        if t_imgs_counter > 10:
-            break
         t_imgs_counter += 1
-        
-        
-    exit()
-#     imgs = imgs = [(imread(f)[...,:3]).astype(np.uint8) for f in imgfiles]
-#     imgs = np.stack(imgs, -1)  
 
     # subset the poses, bounds, and intrinsic values to only include the validation set
-    val_poses = poses[:,:,val_indices]
-    val_bds = bds[:,val_indices]
+    val_poses = poses[val_indices,:,:]
+    val_bds = bds[val_indices,:]
     val_fxfycxcy = fxfycxcy[val_indices,:]
     
-    print('Loaded image data', imgs.shape, poses[:,-1,0])
-###
-
-
-    poses, bds, imgs, fxfycxcy, bgs = _load_data(basedir, factor=factor, subset_size=subset_size, bgimgdir=bgimgdir) # factor=8 downsamples original imgs by 8x
+    print('Loaded image data')
     print('Loaded', basedir, bds.min(), bds.max())
-    
-    if recenter:
-        poses = recenter_poses(poses)
-        
-    if spherify:
-        poses, render_poses, bds = spherify_poses(poses, bds) 
-        
-    render_poses = np.array(render_poses).astype(np.float32)
 
-    c2w = poses_avg(poses)
-    print('Data:')
-    print(poses.shape, imgs.shape, bgs.shape, bds.shape)
+    print('Val data:')
+    print(val_poses.shape, val_bds.shape, val_fxfycxcy.shape)
     
-    dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
-    i_test = np.argmin(dists)
-    print('HOLDOUT view is', i_test)
-    
-    poses = poses.astype(np.float32)
 
-    return val_imgs, val_bgs, val_poses, val_fxfycxcy, val_bds, render_poses, i_test
+    return rays_od, rays_rgb, val_imgs, val_poses, val_fxfycxcy, render_poses, bds

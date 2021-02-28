@@ -6,6 +6,10 @@ dataset_type = lbx
 
 llffhold = 8
 
+spherify = True
+no_ndc = True
+lindisp = True
+
 N_rand = 1024
 N_samples = 64
 N_importance = 128
