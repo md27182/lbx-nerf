@@ -148,7 +148,7 @@ def select_camera_indices():
 
 
 def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor, recenter=True, spherify=True, path_zflat=False):
-        
+    
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
     bds = poses_arr[:, -2:].transpose([1,0])
@@ -171,6 +171,7 @@ def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor, recenter=True, s
     poses[:2, 4, :] = sh[:2].reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor # scale focal length by factor
     
+    # load intrinsics and distortions
     intrinsics = np.load(basedir + '/calibration_data/cam_mtx_list.npy')
     intr_poses = np.zeros((3240,) + intrinsics.shape[1:]) # new intrinsics array parallel to the poses array
     fxfycxcy = np.zeros((3240, 4))
@@ -288,3 +289,6 @@ def load_lbx_data(basedir, bgimgdir, num_rays, holdout, factor, recenter=True, s
     
 
     return rays_od, rays_rgb, val_imgs, val_poses, val_fxfycxcy, render_poses, bds
+
+if __name__ == '__main__':
+    train(sys.argv[1:])
