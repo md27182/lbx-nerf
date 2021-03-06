@@ -1,15 +1,16 @@
 # To run: conda env create -f environment.yml
-name: nerf
+name: lbx-nerf
 channels:
+    - anaconda
     - conda-forge
 dependencies:
     - python=3.7
     - pip
-    - cudatoolkit=10.0
-    - tensorflow-gpu==1.15
-    - numpy==1.19
+    - cudatoolkit
+    - tensorflow=2.3
+    - numpy
     - matplotlib
     - imageio
     - imageio-ffmpeg
     - configargparse
-    - imagemagick
+    - opencv

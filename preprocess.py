@@ -1,8 +1,10 @@
+import os
+# os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
 import cv2
 import numpy as np
 import tensorflow as tf
 import random
-import os
 import imageio
 from tqdm import tqdm
 from run_nerf_helpers import *
@@ -23,8 +25,12 @@ def select_camera_indices():
     return np.array(indices)
 
 
-def get_image(location):
-    return None
+def get_image(img_location):
+    if 's3:' in img_location:
+        #TODO: Implement S3 direct-to-RAM download
+        return None
+    else:
+        return imageio.imread(img_location)
 
 
 def config_parser():
@@ -58,16 +64,36 @@ def main(_args):
     parser = config_parser()
     args = parser.parse_args(_args)
     
+    num_rays = args.num_rays
     factor = args.scale_factor
     data_loc = args.data_location
+    bg_data_loc = args.bg_data_location
+    
     if 's3:' in data_loc:
         base_dir = './data/lbx/' + data_loc[data_loc.rindex('/') + 13:]
         os.makedirs(base_dir, exist_ok=True)
         
         os.makedirs(os.path.join(base_dir, 'calibration_data'), exist_ok=True)
         #TODO download calibration files from S3
+        #TODO create imgfiles by reading from S3
+        imgfiles = None
     else:
         base_dir = data_loc
+        imgdir = os.path.join(base_dir, 'images')
+        imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) 
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+        
+    if 's3:' in bg_data_loc:
+        pass
+    else:
+        bgimgdir = os.path.join(bg_data_loc, 'images')
+        bgimgfiles = [os.path.join(bgimgdir, f) for f in sorted(os.listdir(bgimgdir)) 
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+        print(bgimgfiles[0])
+        
+    # load an image to find it's shape
+    img0 = get_image(imgfiles[0])
+    sh = ((1. / factor) * np.array(img0.shape)).astype(np.int32)
     
     # generate poses from calibration files
     
@@ -75,6 +101,11 @@ def main(_args):
     extrinsics = np.load(os.path.join(base_dir, 'calibration_data', 'cam_extrinsics.npy'))
     locations = np.load(os.path.join(base_dir, 'calibration_data', 'cam_locations.npy'))
     distortions = np.load(os.path.join(base_dir, 'calibration_data', 'cam_dist_list.npy'))
+    fxfycxcy = np.zeros((intrinsics.shape[0], 4))
+    for row in range(intrinsics.shape[0]):
+        fxfycxcy[row] = np.array([intrinsics[row, 0, 0], intrinsics[row, 1, 1], 
+                                     intrinsics[row, 0, 2], intrinsics[row, 1, 2]]) 
+    fxfycxcy = fxfycxcy * (1./factor)
 
     # Cosine and sine of 180 degrees
     c = -1 
@@ -114,9 +145,10 @@ def main(_args):
     
     # sample from subset of evenly spaced camera poses
     indices_subset = select_camera_indices()
+    indices_subset = indices_subset[::200]
     
     num_test_imgs = args.num_test_imgs
-    test_indices = indices_subset[np.linspace(0, indices_subset.size, num_test_imgs).astype(np.int32)]
+    test_indices = indices_subset[np.linspace(0, indices_subset.size - 1, num_test_imgs).astype(np.int32)]
     test_poses = []
     test_fxfycxcy = []
     test_dir = os.path.join(base_dir, "test")
@@ -124,8 +156,8 @@ def main(_args):
     print('test indices: ', test_indices)
     
     num_v_imgs = args.num_v_imgs
-    remaining_indices = np.array([x if x not in test_indices for x in indices_subset])
-    v_indices = remaining_indices[np.linspace(0, remaining_indices.size, num_v_imgs).astype(np.int32)]
+    remaining_indices = np.array([x for x in indices_subset if x not in test_indices])
+    v_indices = remaining_indices[np.linspace(0, remaining_indices.size - 1, num_v_imgs).astype(np.int32)]
     v_poses = []
     v_fxfycxcy = []
     v_dir = os.path.join(base_dir, "validation")
@@ -133,9 +165,10 @@ def main(_args):
     print('validation indices: ', v_indices)
     
     num_training_images = indices_subset.size - num_v_imgs - num_test_imgs
-    rays_per_img = np.ceil(num_rays / num_training_images).astype(np.int32)
+    rays_per_img = np.ceil(num_rays / num_training_images)
     if rays_per_img > (sh[0] * sh[1]):
         rays_per_img = sh[0] * sh[1]
+    rays_per_img = int(rays_per_img)
         
     num_rays_to_load = num_training_images * rays_per_img
     rays_od = np.zeros((num_rays_to_load, 2, 3), dtype=np.float32) # [ray_number, origin or direction, xyz]
@@ -145,32 +178,34 @@ def main(_args):
     
     t_imgs_counter = 0
     
-    for i, index in tqdm(enumerate(indices_subset)):
+    for index in tqdm(indices_subset):
+        
+        row = index // 120
         
         # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
         img = imageio.imread(imgfiles[index])[...,:3]
-        img = cv2.undistort(img, intr_poses[index], dist_poses[index])
+        img = cv2.undistort(img, intrinsics[row], distortions[row])
         img = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
         
         bgimg = imageio.imread(bgimgfiles[index])[...,:3]
-        bgimg = cv2.undistort(bgimg, intr_poses[index], dist_poses[index])
+        bgimg = cv2.undistort(bgimg, intrinsics[row], distortions[row])
         bgimg = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
         
-        pose = poses[index, :3, :4]
+        pose = poses[index]
 
         # check if this image is a validation or test image
         if index in v_indices:
-            save_path = os.join(v_dir, 'images', str(index).zfill(4) + '.jpg')
+            save_path = os.path.join(v_dir, 'images', str(index).zfill(4) + '.jpg')
             imageio.imwrite(save_path, img.astype(np.uint8))
             v_poses.append(pose)
-            v_fxfycxcy.append(fxfycxcy[index])
+            v_fxfycxcy.append(fxfycxcy[row])
             continue
             
         elif index in test_indices:
-            save_path = os.join(test_dir, 'images', str(index).zfill(4) + '.jpg')
+            save_path = os.path.join(test_dir, 'images', str(index).zfill(4) + '.jpg')
             imageio.imwrite(save_path, img.astype(np.uint8))
             test_poses.append(pose)
-            test_fxfycxcy.append(fxfycxcy[index])
+            test_fxfycxcy.append(fxfycxcy[row])
             continue
         
         h_img, w_img = img.shape[:2]
@@ -183,22 +218,22 @@ def main(_args):
         diff = img - bgimg
         matte = np.abs(diff) > val_thresh
         matte = matte.reshape(h_img // h_bin, h_bin, w_img // w_bin, w_bin, 3).sum(3).sum(1).sum(-1)
-        # find the bins for which more than 5% of the pixels exceed val_thresh
+        # find the bins for which more than 5% of the pixels exceed val_thresh, TODO make sure not all bins are False
         matte = matte > count_thresh
-
+        
         # scale the matte back up to h_img, w_img
         matte = np.repeat(np.repeat(matte, h_bin, axis=0), w_bin, axis=1)
         
-        
         # get rays from image
-        rays_o, rays_d = get_rays(h_img, w_img, fxfycxcy[index], pose)
+        #i, j = tf.meshgrid(tf.range(w_img, dtype=tf.float32), tf.range(h_img, dtype=tf.float32), indexing='xy')
+        rays_o, rays_d = get_rays(h_img, w_img, fxfycxcy[row], pose)
         
         ray_numbers = range(t_imgs_counter * rays_per_img, (t_imgs_counter + 1) * rays_per_img)
 
         coords = tf.stack(tf.meshgrid(tf.range(h_img), tf.range(w_img), indexing='ij'), -1)
         good_coords = tf.boolean_mask(coords, matte)
         good_coords = tf.reshape(good_coords, [-1, 2])
-
+        
         select_inds = np.random.choice(good_coords.shape[0], size=[rays_per_img], replace=False)
         select_inds = tf.gather_nd(good_coords, select_inds[:, tf.newaxis])
         
@@ -214,6 +249,9 @@ def main(_args):
     if rays_rgb.size > num_rays:
         rays_rgb = rays_rgb[:num_rays]
         rays_od = rays_od[:num_rays]
+        
+    # shuffle rays and save + upload
+    #TODO
         
     # save test and validation data
     np.save(os.path.join(v_dir, 'poses'), np.array(v_poses))
