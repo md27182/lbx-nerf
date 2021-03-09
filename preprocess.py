@@ -1,13 +1,26 @@
 import os
-# os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-
+import sys
 import cv2
+import time
 import numpy as np
-import tensorflow as tf
 import random
 import imageio
 from tqdm import tqdm
-from run_nerf_helpers import *
+from functools import partial
+import multiprocessing as mp
+import shutil
+
+
+def get_rays_np(H, W, fxfycxcy, c2w):
+    """Get ray origins, directions from a pinhole camera."""
+    fx, fy, cx, cy = fxfycxcy
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32),
+                       np.arange(H, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-cx)/fx, -(j-cy)/fy, -np.ones_like(i)], -1)
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
+    return rays_o, rays_d
+
 
 # selects 2134 evenly spaced poses out of the full 3240
 def select_camera_indices():
@@ -25,12 +38,99 @@ def select_camera_indices():
     return np.array(indices)
 
 
+def pose_from_ext(extrinsic):
+    
+    # Cosine and sine of 180 degrees
+    c = -1 
+    s = 0
+    rot_x = np.array([
+        [1, 0, 0, 0],
+        [0, c, -s, 0],
+        [0, s, c, 0],
+        [0, 0, 0, 1]
+    ])
+
+    # Apply an additional rotation of 180-degrees about the x-axis (OpenCV -> OpenGL convention)
+    temp = np.matmul(rot_x, extrinsic)
+
+    # Convert world-to-camera to camera-to-world
+    temp = np.linalg.inv(temp)
+
+    # Get rid of the last row, which is always(0, 0, 0, 1)
+    temp = temp[:3, :]
+    
+    return temp
+
+
 def get_image(img_location):
     if 's3:' in img_location:
         #TODO: Implement S3 direct-to-RAM download
         return None
     else:
         return imageio.imread(img_location)
+    
+    
+def process_one_image(rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, extrinsics, v_dir, test_dir, v_indices, test_indices, index):
+
+        row = index // 120
+        
+        # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
+        # should we use a gaussian blur instead of resizing?
+        img = imageio.imread(imgfiles[index])[...,:3]
+        img = cv2.undistort(img, intrinsics[row], distortions[row])
+        img = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
+        
+        bgimg = imageio.imread(bgimgfiles[index])[...,:3]
+        bgimg = cv2.undistort(bgimg, intrinsics[row], distortions[row])
+        bgimg = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
+        
+        pose = pose_from_ext(extrinsics[index])
+
+        # check if this image is a validation or test image
+        if index in v_indices:
+            save_path = os.path.join(v_dir, 'images', str(index).zfill(4) + '.jpg')
+            imageio.imwrite(save_path, img.astype(np.uint8))
+            return 'validation', pose, fxfycxcy[row]
+            
+        elif index in test_indices:
+            save_path = os.path.join(test_dir, 'images', str(index).zfill(4) + '.jpg')
+            imageio.imwrite(save_path, img.astype(np.uint8))
+            return 'test', pose, fxfycxcy[row]
+        
+        h_img, w_img = img.shape[:2]
+        h_bin, w_bin = 200, 200
+        
+        val_thresh = 10
+        count_thresh = 0.05 * (3 * h_bin * w_bin)
+
+        # count the number of r, g, and b diffs in each bin that exceed val_thresh
+        diff = img - bgimg
+        matte = np.abs(diff) > val_thresh
+        matte = matte.reshape(h_img // h_bin, h_bin, w_img // w_bin, w_bin, 3).sum(3).sum(1).sum(-1)
+        
+        # find the bins for which more than 5% of the pixels exceed val_thresh, TODO make sure not all bins are False
+        matte = matte > count_thresh
+        
+        # scale the matte back up to h_img, w_img
+        matte = np.repeat(np.repeat(matte, h_bin, axis=0), w_bin, axis=1)
+        
+        # get rays from image
+        rays_o, rays_d = get_rays_np(h_img, w_img, fxfycxcy[row], pose)
+        
+        coords = np.stack(np.meshgrid(np.arange(h_img), np.arange(w_img), indexing='ij'), -1)
+        good_coords = coords[matte]
+        good_coords = np.reshape(good_coords, [-1, 2])
+        
+        select_inds = np.random.choice(good_coords.shape[0], size=[rays_per_img], replace=False)
+        select_inds = np.transpose(good_coords[select_inds])
+        
+        rays_o = rays_o[select_inds[0], select_inds[1], :]
+        rays_d = rays_d[select_inds[0], select_inds[1], :]
+        
+        rays_rgb_fg = img.astype(np.uint8)[select_inds[0], select_inds[1], :]
+        rays_rgb_bg = bgimg.astype(np.uint8)[select_inds[0], select_inds[1], :]
+        
+        return 'training', rays_o, rays_d, rays_rgb_fg, rays_rgb_bg
 
 
 def config_parser():
@@ -89,7 +189,6 @@ def main(_args):
         bgimgdir = os.path.join(bg_data_loc, 'images')
         bgimgfiles = [os.path.join(bgimgdir, f) for f in sorted(os.listdir(bgimgdir)) 
                     if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
-        print(bgimgfiles[0])
         
     # load an image to find it's shape
     img0 = get_image(imgfiles[0])
@@ -106,42 +205,6 @@ def main(_args):
         fxfycxcy[row] = np.array([intrinsics[row, 0, 0], intrinsics[row, 1, 1], 
                                      intrinsics[row, 0, 2], intrinsics[row, 1, 2]]) 
     fxfycxcy = fxfycxcy * (1./factor)
-
-    # Cosine and sine of 180 degrees
-    c = -1 
-    s = 0
-    rot_x = np.array([
-        [1, 0, 0, 0],
-        [0, c, -s, 0],
-        [0, s, c, 0],
-        [0, 0, 0, 1]
-    ])
-    
-    poses_list = []
-    
-    for index in range(extrinsics.shape[0]):
-        ext = extrinsics[index]
-        loc = locations[index]
-
-        # Figure out which "row" this camera is in: we have to do this because the matrix of
-        # camera intrinsics has shape (27, 3, 3), while the other two arrays have shape (3240, ...) - 
-        # this is because we only create one intrinsic matrix per "row" of the src cam locations
-        row = index // 120
-        intr = intrinsics[row]
-
-        # Apply an additional rotation of 180-degrees about the x-axis (OpenCV -> OpenGL convention)
-        #ext = np.matmul(ext, rot_x)
-        ext = np.matmul(rot_x, ext)
-
-        # Convert world-to-camera to camera-to-world
-        ext = np.linalg.inv(ext)
-
-        # Get rid of the last row, which is always(0, 0, 0, 1)
-        ext = ext[:3, :]
-
-        poses_list.append(ext)
-    
-    poses = np.array(poses_list)
     
     # sample from subset of evenly spaced camera poses
     indices_subset = select_camera_indices()
@@ -152,6 +215,7 @@ def main(_args):
     test_poses = []
     test_fxfycxcy = []
     test_dir = os.path.join(base_dir, "test")
+    shutil.rmtree(test_dir)
     os.makedirs(os.path.join(test_dir, 'images'), exist_ok=True)
     print('test indices: ', test_indices)
     
@@ -161,6 +225,7 @@ def main(_args):
     v_poses = []
     v_fxfycxcy = []
     v_dir = os.path.join(base_dir, "validation")
+    shutil.rmtree(v_dir)
     os.makedirs(os.path.join(v_dir, 'images'), exist_ok=True)
     print('validation indices: ', v_indices)
     
@@ -175,75 +240,31 @@ def main(_args):
     rays_rgb = np.zeros((num_rays_to_load, 2, 3), dtype=np.uint8) # [ray_number, foreground or background, rgb]
     
     # main processing loop
-    
+    num_cpus = mp.cpu_count()
+    p_fn = partial(process_one_image, rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, extrinsics, v_dir, test_dir, v_indices, test_indices)
     t_imgs_counter = 0
     
-    for index in tqdm(indices_subset):
-        
-        row = index // 120
-        
-        # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
-        img = imageio.imread(imgfiles[index])[...,:3]
-        img = cv2.undistort(img, intrinsics[row], distortions[row])
-        img = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
-        
-        bgimg = imageio.imread(bgimgfiles[index])[...,:3]
-        bgimg = cv2.undistort(bgimg, intrinsics[row], distortions[row])
-        bgimg = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
-        
-        pose = poses[index]
-
-        # check if this image is a validation or test image
-        if index in v_indices:
-            save_path = os.path.join(v_dir, 'images', str(index).zfill(4) + '.jpg')
-            imageio.imwrite(save_path, img.astype(np.uint8))
-            v_poses.append(pose)
-            v_fxfycxcy.append(fxfycxcy[row])
-            continue
+    with mp.Pool(num_cpus) as p:
+        for ret in tqdm(p.imap_unordered(p_fn, indices_subset), total=indices_subset.size):
             
-        elif index in test_indices:
-            save_path = os.path.join(test_dir, 'images', str(index).zfill(4) + '.jpg')
-            imageio.imwrite(save_path, img.astype(np.uint8))
-            test_poses.append(pose)
-            test_fxfycxcy.append(fxfycxcy[row])
-            continue
-        
-        h_img, w_img = img.shape[:2]
-        h_bin, w_bin = 200, 200
-        
-        val_thresh = 10
-        count_thresh = 0.05 * (3 * h_bin * w_bin)
+            if ret[0] == 'training':
+                ray_numbers = range(t_imgs_counter * rays_per_img, (t_imgs_counter + 1) * rays_per_img)
 
-        # count the number of r, g, and b diffs in each bin that exceed val_thresh
-        diff = img - bgimg
-        matte = np.abs(diff) > val_thresh
-        matte = matte.reshape(h_img // h_bin, h_bin, w_img // w_bin, w_bin, 3).sum(3).sum(1).sum(-1)
-        # find the bins for which more than 5% of the pixels exceed val_thresh, TODO make sure not all bins are False
-        matte = matte > count_thresh
-        
-        # scale the matte back up to h_img, w_img
-        matte = np.repeat(np.repeat(matte, h_bin, axis=0), w_bin, axis=1)
-        
-        # get rays from image
-        #i, j = tf.meshgrid(tf.range(w_img, dtype=tf.float32), tf.range(h_img, dtype=tf.float32), indexing='xy')
-        rays_o, rays_d = get_rays(h_img, w_img, fxfycxcy[row], pose)
-        
-        ray_numbers = range(t_imgs_counter * rays_per_img, (t_imgs_counter + 1) * rays_per_img)
+                rays_od[ray_numbers, 0, :] = ret[1]
+                rays_od[ray_numbers, 1, :] = ret[2]
 
-        coords = tf.stack(tf.meshgrid(tf.range(h_img), tf.range(w_img), indexing='ij'), -1)
-        good_coords = tf.boolean_mask(coords, matte)
-        good_coords = tf.reshape(good_coords, [-1, 2])
-        
-        select_inds = np.random.choice(good_coords.shape[0], size=[rays_per_img], replace=False)
-        select_inds = tf.gather_nd(good_coords, select_inds[:, tf.newaxis])
-        
-        rays_od[ray_numbers, 0, :] = tf.gather_nd(rays_o, select_inds)
-        rays_od[ray_numbers, 1, :] = tf.gather_nd(rays_d, select_inds)
+                rays_rgb[ray_numbers, 0, :] = ret[3]
+                rays_rgb[ray_numbers, 1, :] = ret[4]
 
-        rays_rgb[ray_numbers, 0, :] = tf.gather_nd(img.astype(np.uint8), select_inds)
-        rays_rgb[ray_numbers, 1, :] = tf.gather_nd(bgimg.astype(np.uint8), select_inds)
-        
-        t_imgs_counter += 1
+                t_imgs_counter += 1
+                
+            elif ret[0] == 'validation':
+                v_poses.append(ret[1])
+                v_fxfycxcy.append(ret[2])
+                
+            elif ret[0] == 'test':
+                test_poses.append(ret[1])
+                test_fxfycxcy.append(ret[2])
     
     # truncate ray arrays to be exactly of size num_rays
     if rays_rgb.size > num_rays:

@@ -1,6 +1,6 @@
 data_location = ./data/lbx/sl2
 bg_data_location = ./data/lbx/bg001
 
-num_v_imgs = 2
-num_test_imgs = 2
+num_v_imgs = 1
+num_test_imgs = 1
 num_rays = 1000
