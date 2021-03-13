@@ -25,8 +25,8 @@ bucket = "lbxlabs.scandata"
 def init_s3_client():
     global s3_client
     s3_client = boto3.client("s3", 
-                      aws_access_key_id = "AKIA3YDO4QV7CCWBFHFN", 
-                      aws_secret_access_key = "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")
+                      aws_access_key_id = "", 
+                      aws_secret_access_key = "")
     
 # this function also adds 's3:' to the begining of every file name returned
 def s3_list_dir(path, suffix):
