@@ -9,6 +9,7 @@ opencv-python = "*"
 imageio = "*"
 tqdm = "*"
 configargparse = "*"
+boto3 = "*"
 
 [dev-packages]
 

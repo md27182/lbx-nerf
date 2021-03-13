@@ -2,13 +2,44 @@ import os
 import sys
 import cv2
 import time
-import numpy as np
 import random
-import imageio
-from tqdm import tqdm
+import json
+import tempfile
 from functools import partial
 import multiprocessing as mp
+
+import numpy as np
+import imageio
+from tqdm import tqdm
 import shutil
+import boto3
+
+
+# define Amazon S3 related constants
+s3_client = boto3.client("s3", 
+                      aws_access_key_id = "AKIA3YDO4QV7CCWBFHFN", 
+                      aws_secret_access_key = "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")
+bucket = "lbxlabs.scandata"
+
+# this function makes a new s3_client for each process, read more here: https://stackoverflow.com/questions/48091874/downloading-multiple-s3-objects-in-parallel-in-python
+def init_s3_client():
+    global s3_client
+    s3_client = boto3.client("s3", 
+                      aws_access_key_id = "AKIA3YDO4QV7CCWBFHFN", 
+                      aws_secret_access_key = "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")
+    
+# this function also adds 's3:' to the begining of every file name returned
+def s3_list_dir(path, suffix):
+    ret_list = []
+    paginator = s3_client.get_paginator('list_objects_v2')
+    pages = paginator.paginate(Bucket=bucket, Prefix=(path))
+    for page in pages:
+        for obj in page['Contents']:
+            ret_list.append(obj['Key'])
+            
+    ret_list = [('s3:' + x) for x in ret_list if x.endswith(suffix)]
+    ret_list.sort()
+    return ret_list
 
 
 def get_rays_np(H, W, fxfycxcy, c2w):
@@ -64,8 +95,10 @@ def pose_from_ext(extrinsic):
 
 def get_image(img_location):
     if 's3:' in img_location:
-        #TODO: Implement S3 direct-to-RAM download
-        return None
+        img_location = img_location[3:]
+        #S3 direct-to-RAM download
+        file = s3_client.get_object(Bucket=bucket, Key=img_location)['Body'].read()
+        return imageio.imread(file)
     else:
         return imageio.imread(img_location)
     
@@ -76,11 +109,11 @@ def process_one_image(rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, 
         
         # image resize expression taken from https://stackoverflow.com/questions/48121916/numpy-resize-rescale-image
         # should we use a gaussian blur instead of resizing?
-        img = imageio.imread(imgfiles[index])[...,:3]
+        img = get_image(imgfiles[index])
         img = cv2.undistort(img, intrinsics[row], distortions[row])
         img = img.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
         
-        bgimg = imageio.imread(bgimgfiles[index])[...,:3]
+        bgimg = get_image(bgimgfiles[index])
         bgimg = cv2.undistort(bgimg, intrinsics[row], distortions[row])
         bgimg = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
         
@@ -141,9 +174,12 @@ def config_parser():
                         help='config file path')
     parser.add_argument("--data_location", type=str,
                         default='./data/lbx/sl2', help='location of foreground images and \
-                        calibration data, can be a directory or s3 location')
+                        calibration data, can be a directory (e.g. ./data/lbx/sl2) or s3 location \
+                        (e.g. s3:210203220030_helicopter)')
     parser.add_argument("--bg_data_location", type=str,
-                        default=None, help='directory where background-only images are stored')
+                        default=None, help='location of background-only images, \
+                        can be a directory (e.g. ./data/lbx/bg001) or s3 location \
+                        (e.g. s3:bg001)')
     parser.add_argument("--scale_factor", type=int,
                         default=2, help='new training images will be 4000/factor by 6000/factor')
     parser.add_argument("--num_v_imgs", type=int,
@@ -170,13 +206,21 @@ def main(_args):
     bg_data_loc = args.bg_data_location
     
     if 's3:' in data_loc:
-        base_dir = './data/lbx/' + data_loc[data_loc.rindex('/') + 13:]
+        s3_loc = data_loc[3:]
+        base_dir = './data/lbx/' + s3_loc
         os.makedirs(base_dir, exist_ok=True)
-        
         os.makedirs(os.path.join(base_dir, 'calibration_data'), exist_ok=True)
-        #TODO download calibration files from S3
-        #TODO create imgfiles by reading from S3
-        imgfiles = None
+        
+        # download calibration files from S3
+        calibration_file_names = ['cam_mtx_list.npy', 'cam_extrinsics.npy', 'cam_dist_list.npy', 'cam_locations.npy']
+        for f in calibration_file_names:
+            object_name = s3_loc + '/calibration_data/' + f
+            dest_path = os.path.join(base_dir, 'calibration_data', f)
+            s3_client.download_file(bucket, object_name, dest_path)
+        
+        # create imgfiles by checking s3
+        imgfiles = s3_list_dir(s3_loc + '/images', 'jpg')
+        
     else:
         base_dir = data_loc
         imgdir = os.path.join(base_dir, 'images')
@@ -184,7 +228,8 @@ def main(_args):
                     if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
         
     if 's3:' in bg_data_loc:
-        pass
+        s3_loc = bg_data_loc[3:]
+        bgimgfiles = s3_list_dir(s3_loc + '/images', 'jpg')
     else:
         bgimgdir = os.path.join(bg_data_loc, 'images')
         bgimgfiles = [os.path.join(bgimgdir, f) for f in sorted(os.listdir(bgimgdir)) 
@@ -198,8 +243,8 @@ def main(_args):
     
     intrinsics = np.load(os.path.join(base_dir, 'calibration_data', 'cam_mtx_list.npy'))
     extrinsics = np.load(os.path.join(base_dir, 'calibration_data', 'cam_extrinsics.npy'))
-    locations = np.load(os.path.join(base_dir, 'calibration_data', 'cam_locations.npy'))
     distortions = np.load(os.path.join(base_dir, 'calibration_data', 'cam_dist_list.npy'))
+    locations = np.load(os.path.join(base_dir, 'calibration_data', 'cam_locations.npy'))
     fxfycxcy = np.zeros((intrinsics.shape[0], 4))
     for row in range(intrinsics.shape[0]):
         fxfycxcy[row] = np.array([intrinsics[row, 0, 0], intrinsics[row, 1, 1], 
@@ -208,14 +253,14 @@ def main(_args):
     
     # sample from subset of evenly spaced camera poses
     indices_subset = select_camera_indices()
-    indices_subset = indices_subset[::200]
     
     num_test_imgs = args.num_test_imgs
     test_indices = indices_subset[np.linspace(0, indices_subset.size - 1, num_test_imgs).astype(np.int32)]
     test_poses = []
     test_fxfycxcy = []
     test_dir = os.path.join(base_dir, "test")
-    shutil.rmtree(test_dir)
+    if os.path.isdir(test_dir):
+        shutil.rmtree(test_dir)
     os.makedirs(os.path.join(test_dir, 'images'), exist_ok=True)
     print('test indices: ', test_indices)
     
@@ -225,7 +270,8 @@ def main(_args):
     v_poses = []
     v_fxfycxcy = []
     v_dir = os.path.join(base_dir, "validation")
-    shutil.rmtree(v_dir)
+    if os.path.isdir(v_dir):
+        shutil.rmtree(v_dir)
     os.makedirs(os.path.join(v_dir, 'images'), exist_ok=True)
     print('validation indices: ', v_indices)
     
@@ -244,7 +290,7 @@ def main(_args):
     p_fn = partial(process_one_image, rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, extrinsics, v_dir, test_dir, v_indices, test_indices)
     t_imgs_counter = 0
     
-    with mp.Pool(num_cpus) as p:
+    with mp.Pool(num_cpus, init_s3_client()) as p:
         for ret in tqdm(p.imap_unordered(p_fn, indices_subset), total=indices_subset.size):
             
             if ret[0] == 'training':
@@ -271,14 +317,30 @@ def main(_args):
         rays_rgb = rays_rgb[:num_rays]
         rays_od = rays_od[:num_rays]
         
-    # shuffle rays and save + upload
-    #TODO
+    # shuffle rays
+    print('shuffling rays')
+    shuffler = np.random.permutation(rays_rgb.shape[0])
+    rays_rgb = rays_rgb[shuffler]
+    rays_od = rays_od[shuffler]
+    print('done')
+    
+    # save rays locally
+    train_dir = os.path.join(base_dir, 'training')
+    os.makedirs(train_dir, exist_ok=True)
+    np.savez(os.path.join(train_dir, 'preprocessed.npz'), rays_od, rays_rgb)
         
     # save test and validation data
     np.save(os.path.join(v_dir, 'poses'), np.array(v_poses))
     np.save(os.path.join(v_dir, 'fxfycxcy'), np.array(v_fxfycxcy))
     np.save(os.path.join(test_dir, 'poses'), np.array(test_poses))
     np.save(os.path.join(test_dir, 'fxfycxcy'), np.array(test_fxfycxcy))
+    
+    # generate bounds, not needed for NSVF
+    dists = np.linalg.norm(locations, axis=1)
+    bds = np.stack((dists - 24, 2.5 * dists))
+    np.save(os.path.join(base_dir, 'bds.npy'), bds)
+    
+    #TODO upload preprocessed dataset to s3
 
 if __name__ == '__main__':
     main(sys.argv[1:])
