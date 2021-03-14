@@ -1,6 +1,6 @@
 data_location = s3:210203220030
 bg_data_location = s3:bg001
 
-num_v_imgs = 1
-num_test_imgs = 1
-num_rays = 10240000
+num_v_imgs = 10
+num_test_imgs = 10
+num_rays = 1024000000

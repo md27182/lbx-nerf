@@ -17,8 +17,8 @@ import boto3
 
 # define Amazon S3 related constants
 s3_client = boto3.client("s3", 
-                      aws_access_key_id = "AKIA3YDO4QV7CCWBFHFN", 
-                      aws_secret_access_key = "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")
+                      aws_access_key_id = os.environ['AWS_ACCESS_KEY_ID'], 
+                      aws_secret_access_key = os.environ['AWS_SECRET_ACCESS_KEY'])
 bucket = "lbxlabs.scandata"
 
 # this function makes a new s3_client for each process, read more here: https://stackoverflow.com/questions/48091874/downloading-multiple-s3-objects-in-parallel-in-python
