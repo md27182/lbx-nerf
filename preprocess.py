@@ -16,17 +16,19 @@ import boto3
 
 
 # define Amazon S3 related constants
+AWS_ACCESS_KEY_ID = os.environ['AWS_ACCESS_KEY_ID']
+AWS_SECRET_ACCESS_KEY = os.environ['AWS_SECRET_ACCESS_KEY']
 s3_client = boto3.client("s3", 
-                      aws_access_key_id = os.environ['AWS_ACCESS_KEY_ID'], 
-                      aws_secret_access_key = os.environ['AWS_SECRET_ACCESS_KEY'])
+                      aws_access_key_id = AWS_ACCESS_KEY_ID, 
+                      aws_secret_access_key = AWS_SECRET_ACCESS_KEY)
 bucket = "lbxlabs.scandata"
 
 # this function makes a new s3_client for each process, read more here: https://stackoverflow.com/questions/48091874/downloading-multiple-s3-objects-in-parallel-in-python
 def init_s3_client():
     global s3_client
     s3_client = boto3.client("s3", 
-                      aws_access_key_id = "", 
-                      aws_secret_access_key = "")
+                      aws_access_key_id = AWS_ACCESS_KEY_ID, 
+                      aws_secret_access_key = AWS_SECRET_ACCESS_KEY)
     
 # this function also adds 's3:' to the begining of every file name returned
 def s3_list_dir(path, suffix):
@@ -40,6 +42,112 @@ def s3_list_dir(path, suffix):
     ret_list = [('s3:' + x) for x in ret_list if x.endswith(suffix)]
     ret_list.sort()
     return ret_list
+    
+def recenter_poses(poses):
+
+    poses_ = poses+0
+    bottom = np.reshape([0,0,0,1.], [1,4])
+    c2w = poses_avg(poses)
+    c2w = np.concatenate([c2w[:3,:4], bottom], -2)
+    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
+    poses = np.concatenate([poses[:,:3,:4], bottom], -2)
+
+    poses = np.linalg.inv(c2w) @ poses
+    poses_[:,:3,:4] = poses[:,:3,:4]
+    poses = poses_
+    return poses
+    
+def poses_avg(poses):
+
+    hwf = poses[0, :3, -1:]
+
+    center = poses[:, :3, 3].mean(0)
+    vec2 = normalize(poses[:, :3, 2].sum(0))
+    up = poses[:, :3, 1].sum(0)
+    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
+    
+    return c2w
+    
+def normalize(x):
+    return x / np.linalg.norm(x)
+    
+def viewmatrix(z, up, pos):
+    vec2 = normalize(z)
+    vec1_avg = up
+    vec0 = normalize(np.cross(vec1_avg, vec2))
+    vec1 = normalize(np.cross(vec2, vec0))
+    m = np.stack([vec0, vec1, vec2, pos], 1)
+    return m
+    
+def spherify_poses(poses, bds):
+
+    # transpose bounds to make them match bmild format
+    bds = np.transpose(bds)
+
+    # add last col to poses to make them match bmild format
+    hwf = np.zeros((3240, 3, 1))
+    poses = np.concatenate((poses, hwf), axis=2)
+    
+    p34_to_44 = lambda p : np.concatenate([p, np.tile(np.reshape(np.eye(4)[-1,:], [1,1,4]), [p.shape[0], 1,1])], 1)
+    
+    rays_d = poses[:,:3,2:3]
+    rays_o = poses[:,:3,3:4]
+
+    def min_line_dist(rays_o, rays_d):
+        A_i = np.eye(3) - rays_d * np.transpose(rays_d, [0,2,1])
+        b_i = -A_i @ rays_o
+        pt_mindist = np.squeeze(-np.linalg.inv((np.transpose(A_i, [0,2,1]) @ A_i).mean(0)) @ (b_i).mean(0))
+        return pt_mindist
+
+    pt_mindist = min_line_dist(rays_o, rays_d)
+    
+    center = pt_mindist
+    up = (poses[:,:3,3] - center).mean(0)
+
+    vec0 = normalize(up)
+    vec1 = normalize(np.cross([.1,.2,.3], vec0))
+    vec2 = normalize(np.cross(vec0, vec1))
+    pos = center
+    c2w = np.stack([vec1, vec2, vec0, pos], 1)
+
+    poses_reset = np.linalg.inv(p34_to_44(c2w[None])) @ p34_to_44(poses[:,:3,:4])
+
+    rad = np.sqrt(np.mean(np.sum(np.square(poses_reset[:,:3,3]), -1))) # radius?
+    
+    sc = 1./rad
+    poses_reset[:,:3,3] *= sc
+    bds *= sc
+    rad *= sc # rad = 1?
+    
+    centroid = np.mean(poses_reset[:,:3,3], 0)
+    zh = centroid[2]
+    radcircle = np.sqrt(rad**2-zh**2)
+    new_poses = []
+    
+    # generates new render path
+    for th in np.linspace(0.,2.*np.pi, 120):
+
+        camorigin = np.array([radcircle * np.cos(th), radcircle * np.sin(th), zh])
+        up = np.array([0,0,-1.])
+
+        vec2 = normalize(camorigin)
+        vec0 = normalize(np.cross(vec2, up))
+        vec1 = normalize(np.cross(vec2, vec0))
+        pos = camorigin
+        p = np.stack([vec0, vec1, vec2, pos], 1)
+
+        new_poses.append(p)
+
+    new_poses = np.stack(new_poses, 0)
+    
+    new_poses = np.concatenate([new_poses, np.broadcast_to(poses[0,:3,-1:], new_poses[:,:3,-1:].shape)], -1)
+    poses_reset = np.concatenate([poses_reset[:,:3,:4], np.broadcast_to(poses[0,:3,-1:], poses_reset[:,:3,-1:].shape)], -1)
+    
+    # retranslate back to lbx format
+    bds = np.transpose(bds)
+    poses = poses[:, :, :4]
+
+    return poses_reset, bds
 
 
 def get_rays_np(H, W, fxfycxcy, c2w):
@@ -103,7 +211,7 @@ def get_image(img_location):
         return imageio.imread(img_location)
     
     
-def process_one_image(rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, extrinsics, v_dir, test_dir, v_indices, test_indices, index):
+def process_one_image(rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, poses, v_dir, test_dir, v_indices, test_indices, index):
 
         row = index // 120
         
@@ -117,7 +225,8 @@ def process_one_image(rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, 
         bgimg = cv2.undistort(bgimg, intrinsics[row], distortions[row])
         bgimg = bgimg.reshape(sh[0], factor, sh[1], factor, 3).mean(3).mean(1)
         
-        pose = pose_from_ext(extrinsics[index])
+        #pose = pose_from_ext(extrinsics[index])
+        pose = poses[index]
 
         # check if this image is a validation or test image
         if index in v_indices:
@@ -239,8 +348,7 @@ def main(_args):
     img0 = get_image(imgfiles[0])
     sh = ((1. / factor) * np.array(img0.shape)).astype(np.int32)
     
-    # generate poses from calibration files
-    
+    # load calibration data
     intrinsics = np.load(os.path.join(base_dir, 'calibration_data', 'cam_mtx_list.npy'))
     extrinsics = np.load(os.path.join(base_dir, 'calibration_data', 'cam_extrinsics.npy'))
     distortions = np.load(os.path.join(base_dir, 'calibration_data', 'cam_dist_list.npy'))
@@ -250,6 +358,19 @@ def main(_args):
         fxfycxcy[row] = np.array([intrinsics[row, 0, 0], intrinsics[row, 1, 1], 
                                      intrinsics[row, 0, 2], intrinsics[row, 1, 2]]) 
     fxfycxcy = fxfycxcy * (1./factor)
+
+    # create poses array
+    poses = np.zeros((extrinsics.shape[0], 3, 4))
+    for i in range(extrinsics.shape[0]):
+        poses[i] = pose_from_ext(extrinsics[i])
+
+    # generate bounds, not needed for NSVF
+    dists = np.linalg.norm(locations, axis=1)
+    bds = np.stack((dists - 24, 2.5 * dists))
+
+    # recenter and spherify
+    # poses = recenter_poses(poses) forgot to modify recenter function so just taking it out for now
+    poses, bds = spherify_poses(poses, bds)
     
     # sample from subset of evenly spaced camera poses
     indices_subset = select_camera_indices()
@@ -287,7 +408,7 @@ def main(_args):
     
     # main processing loop
     num_cpus = mp.cpu_count()
-    p_fn = partial(process_one_image, rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, extrinsics, v_dir, test_dir, v_indices, test_indices)
+    p_fn = partial(process_one_image, rays_per_img, sh, factor, imgfiles, bgimgfiles, fxfycxcy, intrinsics, distortions, poses, v_dir, test_dir, v_indices, test_indices)
     t_imgs_counter = 0
     
     with mp.Pool(num_cpus, init_s3_client()) as p:
@@ -334,12 +455,10 @@ def main(_args):
     np.save(os.path.join(v_dir, 'fxfycxcy'), np.array(v_fxfycxcy))
     np.save(os.path.join(test_dir, 'poses'), np.array(test_poses))
     np.save(os.path.join(test_dir, 'fxfycxcy'), np.array(test_fxfycxcy))
-    
-    # generate bounds, not needed for NSVF
-    dists = np.linalg.norm(locations, axis=1)
-    bds = np.stack((dists - 24, 2.5 * dists))
+
+    # save bounds, not needed for NSVF
     np.save(os.path.join(base_dir, 'bds.npy'), bds)
-    
+
     #TODO upload preprocessed dataset to s3
 
 if __name__ == '__main__':

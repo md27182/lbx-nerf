@@ -3,4 +3,4 @@ bg_data_location = s3:bg001
 
 num_v_imgs = 10
 num_test_imgs = 10
-num_rays = 1024000000
+num_rays = 10240000

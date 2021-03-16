@@ -10,6 +10,7 @@ import random
 import time
 from run_nerf_helpers import *
 
+# tf.debugging.set_log_device_placement(True)
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
@@ -143,11 +144,13 @@ def render_rays(ray_batch,
             weights[..., None] * rgb, axis=-2)  # [N_rays, 3]
 
         # Estimated depth map is expected distance.
-        depth_map = tf.reduce_sum(weights * z_vals, axis=-1)
+        # depth_map = tf.reduce_sum(weights * z_vals, axis=-1)
+        depth_map = None
 
         # Disparity map is inverse depth.
-        disp_map = 1./tf.maximum(1e-10, depth_map /
-                                 tf.reduce_sum(weights, axis=-1))
+        # disp_map = 1./tf.maximum(1e-10, depth_map /
+        #                          tf.reduce_sum(weights, axis=-1))
+        disp_map = None
 
         # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
         acc_map = tf.reduce_sum(weights, -1)
@@ -226,17 +229,15 @@ def render_rays(ray_batch,
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d, bg)
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    # ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    ret = {'rgb_map': rgb_map, 'acc_map': acc_map}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
-        ret['disp0'] = disp_map_0
+        # ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
-
-    for k in ret:
-        tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
 
     return ret
 
@@ -245,7 +246,11 @@ def batchify_rays(rays_flat, chunk=1024*32, bg=None, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], bg=bg, **kwargs)
+        if bg is not None:
+            bg_batch = bg[i:i+chunk]
+        else:
+            bg_batch = None
+        ret = render_rays(rays_flat[i:i+chunk], bg=bg_batch, **kwargs)
         for k in ret:
             if k not in all_ret:
                 all_ret[k] = []
@@ -328,7 +333,8 @@ def render(H, W, fxfycxcy,
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    # k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    k_extract = ['rgb_map', 'acc_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -556,9 +562,11 @@ def train(_args):
     # Load data
     if args.dataset_type == 'lbx':
         
+        print('loading data from preprocessed.npz')
         preprocessed_path = os.path.join(args.datadir, 'training/preprocessed.npz')
         npz = np.load(preprocessed_path)
         rays_od, rays_rgb = [npz[i] for i in npz.files]
+        print('done loading')
         
         bds = np.load(os.path.join(args.datadir, 'bds.npy'))
         val_poses = np.load(os.path.join(args.datadir, 'validation', 'poses.npy'))
@@ -569,6 +577,7 @@ def train(_args):
 
         near = tf.reduce_min(bds) * .9
         far = tf.reduce_max(bds) * 1.
+        print(f'bounds are {near} to {far}')
         
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -664,7 +673,10 @@ def train(_args):
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
-            rgb, disp, acc, extras = render(
+            # rgb, disp, acc, extras = render(
+            #     H, W, None, chunk=args.chunk, rays=batch_rays,
+            #     verbose=i < 10, bg=bg_s, retraw=True, **render_kwargs_train)
+            rgb, acc, extras = render(
                 H, W, None, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, bg=bg_s, retraw=True, **render_kwargs_train)
             
@@ -763,7 +775,9 @@ def train(_args):
                 W_r = W // rf
                 fxfycxcy_r = val_fxfycxcy / rf
                 
-                rgb, disp, acc, extras = render(H_r, W_r, fxfycxcy_r[img_i], chunk=args.chunk, c2w=pose,
+                # rgb, disp, acc, extras = render(H_r, W_r, fxfycxcy_r[img_i], chunk=args.chunk, c2w=pose,
+                #                                 **render_kwargs_test)
+                rgb, acc, extras = render(H_r, W_r, fxfycxcy_r[img_i], chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
 
 #                 psnr = mse2psnr(img2mse(rgb, target))

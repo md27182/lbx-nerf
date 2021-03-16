@@ -1,7 +1,7 @@
 expname = helicopter
-basedir = /home/ec2-user/SageMaker/lbx-nerf/logs
-datadir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/210203220030
-bgimgdir = /home/ec2-user/SageMaker/lbx-nerf/data/lbx/bg001/images
+basedir = ./logs
+datadir = ./data/lbx/210203220030
+bgimgdir = ./data/lbx/bg001/images
 dataset_type = lbx
 
 lindisp = True
@@ -9,6 +9,7 @@ lindisp = True
 N_rand = 1024
 N_samples = 64
 N_importance = 128
+chunk = 512
 
 use_viewdirs = True
 raw_noise_std = 1e0

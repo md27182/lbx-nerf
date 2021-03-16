@@ -4,14 +4,21 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-tensorflow = "==2.3.2"
+#tf_nightly = "*"
+#tf-nightly-gpu = "2.5.0.dev20201028"
+#tensorflow = "2.4.1"
 opencv-python = "*"
 imageio = "*"
 tqdm = "*"
 configargparse = "*"
 boto3 = "*"
+numpy = "*"
+shutil = "*"
 
 [dev-packages]
 
 [requires]
 python_version = "3"
+
+#[pipenv]
+#allow_prereleases = true
